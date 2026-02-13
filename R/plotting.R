@@ -10,9 +10,12 @@ library(ggplot2)
 #' @param drug_name Character, drug name for plot title
 #' @param time_unit Character, time unit for axis label
 #' @param conc_unit Character, concentration unit for axis label
+#' @param color_mode Character, "color" or "bw"
+#' @param show_ci Logical, show SEM ribbon/error bars
 #' @return ggplot object
 plot_mean_conc_time <- function(df, log_y = FALSE, species = "", drug_name = "",
-                                 time_unit = "h", conc_unit = "ng/mL") {
+                                 time_unit = "h", conc_unit = "ng/mL",
+                                 color_mode = "color", show_ci = TRUE) {
   # Compute mean and SEM at each time point
   summary_df <- aggregate(Conc ~ Time, data = df, FUN = function(x) {
     c(mean = mean(x, na.rm = TRUE),
@@ -41,17 +44,28 @@ plot_mean_conc_time <- function(df, log_y = FALSE, species = "", drug_name = "",
   plot_title <- paste("Concentration-Time Profile",
                       if (length(title_parts) > 0) paste("-", paste(title_parts, collapse = " ")) else "")
 
-  p <- ggplot(summary_df, aes(x = Time, y = Mean)) +
-    geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.2, fill = "#2166AC") +
-    geom_line(color = "#2166AC", linewidth = 1) +
-    geom_point(color = "#2166AC", size = 2.5) +
-    geom_errorbar(aes(ymin = Lower, ymax = Upper), width = max(diff(range(summary_df$Time))) * 0.015,
-                  color = "#2166AC", linewidth = 0.5) +
+  is_bw <- (color_mode == "bw")
+  line_col <- if (is_bw) "black" else "#2166AC"
+  fill_col <- if (is_bw) "grey60" else "#2166AC"
+
+  p <- ggplot(summary_df, aes(x = Time, y = Mean))
+
+  if (show_ci) {
+    p <- p +
+      geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.2, fill = fill_col) +
+      geom_errorbar(aes(ymin = Lower, ymax = Upper),
+                    width = max(diff(range(summary_df$Time))) * 0.015,
+                    color = line_col, linewidth = 0.5)
+  }
+
+  p <- p +
+    geom_line(color = line_col, linewidth = 1) +
+    geom_point(color = line_col, size = 2.5, shape = if (is_bw) 16 else 16) +
     labs(
       title = plot_title,
       x = paste0("Time (", time_unit, ")"),
       y = paste0("Concentration (", conc_unit, ")"),
-      caption = paste("Mean \u00B1 SEM, n =", max(summary_df$N))
+      caption = paste("Mean", if (show_ci) "\u00B1 SEM" else "", ", n =", max(summary_df$N))
     ) +
     theme_bw(base_size = 14) +
     theme(
@@ -76,17 +90,36 @@ plot_mean_conc_time <- function(df, log_y = FALSE, species = "", drug_name = "",
 #' @param log_y Logical, use log-transformed y-axis
 #' @param time_unit Character, time unit
 #' @param conc_unit Character, concentration unit
+#' @param color_mode Character, "color" or "bw"
 #' @return ggplot object
 plot_individual_conc_time <- function(df, log_y = FALSE,
-                                       time_unit = "h", conc_unit = "ng/mL") {
-  p <- ggplot(df, aes(x = Time, y = Conc, group = ID, color = ID)) +
-    geom_line(linewidth = 0.7, alpha = 0.7) +
-    geom_point(size = 1.5, alpha = 0.8) +
+                                       time_unit = "h", conc_unit = "ng/mL",
+                                       color_mode = "color") {
+  is_bw <- (color_mode == "bw")
+  n_subj <- length(unique(df$ID))
+
+  if (is_bw) {
+    # Use different linetypes and shapes for BW mode
+    p <- ggplot(df, aes(x = Time, y = Conc, group = ID, linetype = ID, shape = ID)) +
+      geom_line(linewidth = 0.7, alpha = 0.8) +
+      geom_point(size = 1.8, alpha = 0.9) +
+      labs(linetype = "Subject", shape = "Subject")
+    if (n_subj <= 6) {
+      p <- p + scale_linetype_manual(values = rep(c("solid", "dashed", "dotted",
+                                                      "dotdash", "longdash", "twodash"), length.out = n_subj))
+    }
+  } else {
+    p <- ggplot(df, aes(x = Time, y = Conc, group = ID, color = ID)) +
+      geom_line(linewidth = 0.7, alpha = 0.7) +
+      geom_point(size = 1.5, alpha = 0.8) +
+      labs(color = "Subject")
+  }
+
+  p <- p +
     labs(
       title = "Individual Concentration-Time Profiles",
       x = paste0("Time (", time_unit, ")"),
-      y = paste0("Concentration (", conc_unit, ")"),
-      color = "Subject"
+      y = paste0("Concentration (", conc_unit, ")")
     ) +
     theme_bw(base_size = 14) +
     theme(
@@ -102,7 +135,6 @@ plot_individual_conc_time <- function(df, log_y = FALSE,
   }
 
   # Limit legend entries for large datasets
-  n_subj <- length(unique(df$ID))
   if (n_subj > 20) {
     p <- p + theme(legend.position = "none") +
       labs(caption = paste(n_subj, "subjects (legend hidden)"))

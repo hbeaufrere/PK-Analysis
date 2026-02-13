@@ -1,5 +1,5 @@
-# Pharmacokinetic Population Analysis Application
-# Main Shiny Application
+# Population PK Modeling Application
+# Author: Hugues Beaufrere, DVM, PhD, DACZM
 
 library(shiny)
 library(DT)
@@ -14,12 +14,14 @@ source("R/pk_models.R")
 source("R/plotting.R")
 
 # ============================================================
-# Species options with typical weight ranges
+# Species options
 # ============================================================
 species_options <- c(
-  "Human", "Dog", "Cat", "Horse", "Cattle",
-  "Rat", "Mouse", "Rabbit", "Pig", "Sheep", "Goat",
-  "Non-human Primate", "Guinea Pig", "Ferret", "Other"
+  "Orange-winged Amazon parrot", "Cockatiel", "Great horned owl",
+  "Red-tailed hawk", "Rabbit", "Bearded dragon",
+  "Dog", "Cat", "Horse", "Cattle",
+  "Rat", "Mouse", "Pig", "Sheep", "Goat",
+  "Human", "Non-human Primate", "Guinea Pig", "Ferret", "Other"
 )
 
 route_options <- c(
@@ -45,6 +47,7 @@ ui <- fluidPage(
       border-radius: 0 0 8px 8px;
     }
     .main-header h2 { margin: 0 0 5px 0; font-weight: 700; }
+    .main-header .author { margin: 0; opacity: 0.75; font-size: 12px; font-style: italic; }
     .main-header p { margin: 0; opacity: 0.85; font-size: 14px; }
     .well { background-color: #ffffff; border: 1px solid #dce3ec; border-radius: 6px; }
     .nav-tabs > li.active > a { border-top: 3px solid #2d6a9f; font-weight: 600; }
@@ -60,12 +63,14 @@ ui <- fluidPage(
     .status-success { background-color: #e6f4ea; border-color: #34a853; color: #1e4620; }
     .status-error { background-color: #fce8e6; border-color: #ea4335; color: #5f1412; }
     .status-warning { background-color: #fef7e0; border-color: #fbbc04; color: #5f4b08; }
+    .subject-selector .checkbox { margin-top: 2px; margin-bottom: 2px; }
   "))),
 
   # Header
   div(class = "main-header",
-    h2("PopPK Analysis"),
-    p("Population Pharmacokinetic Analysis - Non-Compartmental & Compartmental Modeling")
+    h2("Population PK Modeling"),
+    tags$div(class = "author", "Hugues Beaufr\u00e8re, DVM, PhD, DACZM"),
+    p("Non-Compartmental & Compartmental Modeling")
   ),
 
   sidebarLayout(
@@ -84,7 +89,7 @@ ui <- fluidPage(
 
       textInput("drug_name", "Drug/Compound Name", placeholder = "e.g., Amoxicillin"),
 
-      selectInput("species", "Species", choices = species_options, selected = "Dog"),
+      selectInput("species", "Species", choices = species_options, selected = "Orange-winged Amazon parrot"),
 
       selectInput("route", "Route of Administration", choices = route_options, selected = "IV"),
 
@@ -102,6 +107,17 @@ ui <- fluidPage(
       selectInput("time_unit", "Time Unit",
                   choices = c("h" = "h", "min" = "min", "days" = "days"),
                   selected = "h"),
+
+      # Subject exclusion (appears when data is loaded)
+      conditionalPanel(
+        condition = "output.data_loaded",
+        hr(),
+        h4("Subject Selection", class = "section-title"),
+        helpText("Uncheck subjects to exclude from plots and analysis."),
+        div(class = "subject-selector",
+          uiOutput("subject_checkboxes")
+        )
+      ),
 
       hr(),
       h4("Analysis Settings", class = "section-title"),
@@ -133,9 +149,7 @@ ui <- fluidPage(
         condition = "output.analysis_done",
         hr(),
         h4("Export Results", class = "section-title"),
-        downloadButton("download_params", "Download Parameters (CSV)", class = "btn-block"),
-        br(),
-        downloadButton("download_plot", "Download Plot (PNG)", class = "btn-block")
+        downloadButton("download_params", "Download Parameters (CSV)", class = "btn-block")
       )
     ),
 
@@ -173,12 +187,25 @@ ui <- fluidPage(
             condition = "output.data_loaded",
             wellPanel(
               fluidRow(
-                column(4, checkboxInput("log_y_obs", "Log-transformed Y-axis", value = FALSE)),
-                column(4, radioButtons("plot_type_obs", "Plot Type",
+                column(3, radioButtons("plot_type_obs", "Plot Type",
                                         choices = c("Mean \u00B1 SEM" = "mean",
                                                     "Individual" = "individual",
                                                     "Both" = "both"),
-                                        inline = TRUE, selected = "mean"))
+                                        inline = FALSE, selected = "mean")),
+                column(3,
+                  checkboxInput("log_y_obs", "Log-transformed Y-axis", value = FALSE),
+                  checkboxInput("show_ci", "Show SEM shading", value = TRUE)
+                ),
+                column(3,
+                  radioButtons("color_mode", "Color Scheme",
+                               choices = c("Color" = "color", "Black & White" = "bw"),
+                               inline = FALSE, selected = "color")
+                ),
+                column(3,
+                  downloadButton("download_mean_plot", "Download Mean Plot", class = "btn-block btn-sm"),
+                  br(),
+                  downloadButton("download_indiv_plot", "Download Individual Plot", class = "btn-block btn-sm")
+                )
               )
             ),
             uiOutput("obs_plots_ui")
@@ -275,6 +302,24 @@ server <- function(input, output, session) {
     }
   })
 
+  # ---- Subject Selection Checkboxes ----
+  output$subject_checkboxes <- renderUI({
+    req(rv$data_summary)
+    subjects <- rv$data_summary$subjects
+    checkboxGroupInput("included_subjects", label = NULL,
+                       choices = subjects, selected = subjects)
+  })
+
+  # ---- Filtered data (respects subject exclusion) ----
+  filtered_data <- reactive({
+    req(rv$pk_data)
+    included <- input$included_subjects
+    if (is.null(included) || length(included) == 0) {
+      return(rv$pk_data[0, ])  # empty data frame
+    }
+    rv$pk_data[rv$pk_data$ID %in% included, ]
+  })
+
   # ---- Output flags for conditionalPanel ----
   output$data_loaded <- reactive({ !is.null(rv$pk_data) })
   outputOptions(output, "data_loaded", suspendWhenHidden = FALSE)
@@ -295,21 +340,31 @@ server <- function(input, output, session) {
       div(class = "status-box status-info", icon("info-circle"),
           "Upload a CSV or Excel file. First column = Time, each subsequent column = concentrations for one animal.")
     } else {
+      n_included <- length(input$included_subjects)
+      n_total <- rv$data_summary$n_subjects
+      excl_text <- if (n_included < n_total) paste0(" (", n_total - n_included, " excluded)") else ""
       div(class = "status-box status-success", icon("check-circle"),
-          paste("Data loaded successfully:", rv$data_summary$n_subjects, "subjects,",
-                rv$data_summary$n_observations, "observations"))
+          paste0("Data loaded: ", n_included, " of ", n_total, " subjects included", excl_text,
+                 ", ", nrow(filtered_data()), " observations"))
     }
   })
 
   # ---- Data Summary ----
   output$data_summary_info <- renderUI({
     req(rv$data_summary)
+    fdata <- filtered_data()
     s <- rv$data_summary
+    n_included <- length(input$included_subjects)
     tags$div(
-      tags$p(tags$strong("Subjects: "), s$n_subjects),
-      tags$p(tags$strong("Observations: "), s$n_observations),
+      tags$p(tags$strong("Total Subjects: "), s$n_subjects),
+      tags$p(tags$strong("Included: "), n_included),
+      tags$p(tags$strong("Observations: "), nrow(fdata)),
       tags$p(tags$strong("Time range: "), round(s$time_range[1], 2), " - ", round(s$time_range[2], 2)),
-      tags$p(tags$strong("Conc range: "), round(s$conc_range[1], 3), " - ", round(s$conc_range[2], 3)),
+      if (nrow(fdata) > 0) {
+        tags$p(tags$strong("Conc range: "),
+               round(min(fdata$Conc, na.rm = TRUE), 3), " - ",
+               round(max(fdata$Conc, na.rm = TRUE), 3))
+      },
       tags$p(tags$strong("Subject IDs: "), paste(s$subjects, collapse = ", "))
     )
   })
@@ -328,7 +383,7 @@ server <- function(input, output, session) {
 
   # ---- Observational Plots ----
   output$obs_plots_ui <- renderUI({
-    req(rv$pk_data)
+    req(filtered_data())
     plot_type <- input$plot_type_obs
 
     if (plot_type == "mean") {
@@ -344,35 +399,72 @@ server <- function(input, output, session) {
     }
   })
 
-  output$mean_plot <- renderPlot({
-    req(rv$pk_data)
+  # Helper to build mean plot (reused for display and download)
+  build_mean_plot <- reactive({
+    req(filtered_data(), nrow(filtered_data()) > 0)
     plot_mean_conc_time(
-      rv$pk_data,
+      filtered_data(),
       log_y = input$log_y_obs,
       species = input$species,
       drug_name = input$drug_name,
       time_unit = input$time_unit,
-      conc_unit = input$conc_unit
+      conc_unit = input$conc_unit,
+      color_mode = input$color_mode,
+      show_ci = input$show_ci
     )
   })
 
-  output$indiv_plot <- renderPlot({
-    req(rv$pk_data)
+  # Helper to build individual plot (reused for display and download)
+  build_indiv_plot <- reactive({
+    req(filtered_data(), nrow(filtered_data()) > 0)
     plot_individual_conc_time(
-      rv$pk_data,
+      filtered_data(),
       log_y = input$log_y_obs,
       time_unit = input$time_unit,
-      conc_unit = input$conc_unit
+      conc_unit = input$conc_unit,
+      color_mode = input$color_mode
     )
   })
+
+  output$mean_plot <- renderPlot({ build_mean_plot() })
+  output$indiv_plot <- renderPlot({ build_indiv_plot() })
+
+  # ---- Plot Downloads ----
+  output$download_mean_plot <- downloadHandler(
+    filename = function() {
+      paste0("pk_mean_conc_time_", Sys.Date(), ".png")
+    },
+    content = function(file) {
+      p <- build_mean_plot()
+      ggsave(file, plot = p, width = 10, height = 6, dpi = 300)
+    }
+  )
+
+  output$download_indiv_plot <- downloadHandler(
+    filename = function() {
+      paste0("pk_individual_conc_time_", Sys.Date(), ".png")
+    },
+    content = function(file) {
+      p <- build_indiv_plot()
+      ggsave(file, plot = p, width = 10, height = 6, dpi = 300)
+    }
+  )
 
   # ---- Run Analysis ----
   observeEvent(input$run_analysis, {
-    req(rv$pk_data)
+    fdata <- filtered_data()
+    req(fdata, nrow(fdata) > 0)
 
     # Validate inputs
     if (is.na(input$dose) || input$dose <= 0) {
       showNotification("Please enter a valid dose > 0", type = "error")
+      return()
+    }
+
+    n_subjects <- length(unique(fdata$ID))
+    if (n_subjects < 2 && input$model_type != "NCA") {
+      showNotification("Compartmental models require at least 2 subjects. Include more subjects or use NCA.",
+                       type = "error")
       return()
     }
 
@@ -391,7 +483,7 @@ server <- function(input, output, session) {
         # ---- Non-Compartmental Analysis ----
         incProgress(0.3, detail = "Computing NCA parameters...")
 
-        rv$nca_results <- run_nca(rv$pk_data, input$dose, route_for_model)
+        rv$nca_results <- run_nca(fdata, input$dose, route_for_model)
         rv$nca_summary_results <- nca_summary(rv$nca_results)
         rv$comp_results <- NULL
 
@@ -405,7 +497,7 @@ server <- function(input, output, session) {
         incProgress(0.2, detail = "Estimating initial parameters...")
 
         result <- fit_compartmental_model(
-          rv$pk_data, input$dose, input$model_type, route_for_model
+          fdata, input$dose, input$model_type, route_for_model
         )
 
         if (!is.null(result$error)) {
@@ -545,7 +637,7 @@ server <- function(input, output, session) {
     route_label <- names(route_options)[route_options == input$route]
 
     plot_model_fit(
-      rv$pk_data,
+      filtered_data(),
       rv$comp_results$predictions,
       log_y = input$log_y_fit,
       model_label = paste(model_labels[rv$analysis_type], "-", route_label),
@@ -557,25 +649,25 @@ server <- function(input, output, session) {
   # ---- Diagnostic Plots ----
   output$diag_obs_pred <- renderPlot({
     req(rv$comp_results, rv$comp_results$fit)
-    plots <- plot_diagnostics(rv$comp_results$fit, rv$pk_data)
+    plots <- plot_diagnostics(rv$comp_results$fit, filtered_data())
     plots$obs_vs_pred
   })
 
   output$diag_resid <- renderPlot({
     req(rv$comp_results, rv$comp_results$fit)
-    plots <- plot_diagnostics(rv$comp_results$fit, rv$pk_data)
+    plots <- plot_diagnostics(rv$comp_results$fit, filtered_data())
     plots$resid_vs_pred
   })
 
   output$diag_qq <- renderPlot({
     req(rv$comp_results, rv$comp_results$fit)
-    plots <- plot_diagnostics(rv$comp_results$fit, rv$pk_data)
+    plots <- plot_diagnostics(rv$comp_results$fit, filtered_data())
     plots$qq_plot
   })
 
   output$diag_hist <- renderPlot({
     req(rv$comp_results, rv$comp_results$fit)
-    plots <- plot_diagnostics(rv$comp_results$fit, rv$pk_data)
+    plots <- plot_diagnostics(rv$comp_results$fit, filtered_data())
     plots$resid_hist
   })
 
@@ -586,31 +678,11 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       if (rv$analysis_type == "NCA") {
-        # Write both individual and summary
         write.csv(rv$nca_results, file, row.names = FALSE)
       } else {
-        # Write population + individual params
         pop <- rv$comp_results$summary
-        indiv <- rv$comp_results$params
         write.csv(pop, file, row.names = FALSE)
       }
-    }
-  )
-
-  output$download_plot <- downloadHandler(
-    filename = function() {
-      paste0("pk_conc_time_", Sys.Date(), ".png")
-    },
-    content = function(file) {
-      p <- plot_mean_conc_time(
-        rv$pk_data,
-        log_y = input$log_y_obs,
-        species = input$species,
-        drug_name = input$drug_name,
-        time_unit = input$time_unit,
-        conc_unit = input$conc_unit
-      )
-      ggsave(file, plot = p, width = 10, height = 6, dpi = 300)
     }
   )
 }
