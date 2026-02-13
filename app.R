@@ -79,6 +79,7 @@ ui <- fluidPage(
     .btn-manuscript:hover { background: linear-gradient(135deg, #4a2475 0%, #6a348d 100%); color: white; }
     .api-key-input { max-width: 500px; }
     .compound-section { border-top: 2px solid #2d6a9f; padding-top: 15px; margin-top: 25px; }
+    .btn-block { white-space: normal; }
   "))),
 
   # Header
@@ -1454,17 +1455,51 @@ server <- function(input, output, session) {
           div(class = "compound-section",
             h3(drug),
             plotOutput(paste0("model_fit_plot_", i), height = "500px"),
+            helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+              tags$strong("Model Fit Plot:"),
+              "Circles are observed data for each subject. The solid line is the population-predicted curve ",
+              "(typical animal). Dashed lines are individual-predicted curves (per subject). ",
+              "A good fit shows curves passing through or near the observed data with no systematic bias."
+            ),
             conditionalPanel(
               condition = "input.show_diagnostics",
               hr(),
               h4("Goodness-of-Fit Diagnostics", class = "section-title"),
               fluidRow(
-                column(6, plotOutput(paste0("diag_obs_pred_", i), height = "350px")),
-                column(6, plotOutput(paste0("diag_resid_", i), height = "350px"))
+                column(6,
+                  plotOutput(paste0("diag_obs_pred_", i), height = "350px"),
+                  helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+                    tags$strong("Observed vs. Predicted:"),
+                    "Points should scatter closely around the line of identity (dashed diagonal). ",
+                    "Systematic deviations above or below the line indicate model bias."
+                  )
+                ),
+                column(6,
+                  plotOutput(paste0("diag_resid_", i), height = "350px"),
+                  helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+                    tags$strong("Residuals vs. Predicted:"),
+                    "Residuals should be randomly scattered around zero with no pattern. ",
+                    "A funnel shape suggests heteroscedasticity; curvature indicates model misspecification."
+                  )
+                )
               ),
               fluidRow(
-                column(6, plotOutput(paste0("diag_qq_", i), height = "350px")),
-                column(6, plotOutput(paste0("diag_hist_", i), height = "350px"))
+                column(6,
+                  plotOutput(paste0("diag_qq_", i), height = "350px"),
+                  helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+                    tags$strong("Q-Q Plot:"),
+                    "Points should follow the diagonal line if residuals are normally distributed. ",
+                    "Departures at the extremes may suggest outliers or model issues."
+                  )
+                ),
+                column(6,
+                  plotOutput(paste0("diag_hist_", i), height = "350px"),
+                  helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+                    tags$strong("Residual Histogram:"),
+                    "Should be approximately bell-shaped and centered near zero. ",
+                    "Skewness or multimodality may indicate model misspecification."
+                  )
+                )
               )
             )
           ),
@@ -1475,6 +1510,12 @@ server <- function(input, output, session) {
     } else {
       tagList(
         plotOutput("model_fit_plot", height = "500px"),
+        helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+          tags$strong("Model Fit Plot:"),
+          "Circles are observed data for each subject. The solid line is the population-predicted curve ",
+          "(typical animal). Dashed lines are individual-predicted curves (per subject). ",
+          "A good fit shows curves passing through or near the observed data with no systematic bias."
+        ),
         conditionalPanel(
           condition = "input.show_diagnostics",
           hr(),

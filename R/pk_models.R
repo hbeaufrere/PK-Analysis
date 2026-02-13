@@ -754,21 +754,22 @@ extract_gnls_params <- function(fit, model_type, route, dose, data) {
   pop_params$BIC <- BIC(fit)
   pop_params$logLik <- as.numeric(logLik(fit))
 
-  # For gnls, individual params = population params for each subject
+  # For gnls, individual params = population params for each subject (wide format)
   subjects <- unique(data$ID)
+  extract_fn <- switch(model_type,
+    "1comp" = extract_1comp_params,
+    "2comp" = extract_2comp_params,
+    "3comp" = extract_3comp_params
+  )
   indiv_list <- list()
   for (subj in subjects) {
-    if (model_type == "1comp") {
-      ip <- extract_1comp_params(fe, dose, is_iv)
-    } else if (model_type == "2comp") {
-      ip <- extract_2comp_params(fe, dose, is_iv)
-    } else {
-      ip <- extract_3comp_params(fe, dose, is_iv)
-    }
-    ip$ID <- as.character(subj)
-    indiv_list[[length(indiv_list) + 1]] <- ip
+    ip <- extract_fn(fe, dose, is_iv)
+    row_df <- as.data.frame(as.list(setNames(ip$Estimate, ip$Parameter)),
+                            check.names = FALSE, stringsAsFactors = FALSE)
+    row_df$ID <- as.character(subj)
+    indiv_list[[length(indiv_list) + 1]] <- row_df
   }
-  indiv_df <- do.call(rbind, lapply(indiv_list, as.data.frame, stringsAsFactors = FALSE))
+  indiv_df <- do.call(rbind, indiv_list)
 
   return(list(population = pop_params, individual = indiv_df))
 }
@@ -927,50 +928,31 @@ extract_compartmental_params <- function(fit, model_type, route, dose) {
     if (!is.null(tt) && "DF" %in% colnames(tt)) tt[1, "DF"] else nrow(fit$data) - length(fe)
   }, error = function(e) nrow(fit$data) - length(fe))
 
-  if (model_type == "1comp") {
-    pop_params <- extract_1comp_params(fe, dose, is_iv, vcov_mat, df_resid)
-    # Individual parameters (no SE/CI for individuals)
-    indiv_list <- list()
-    for (i in 1:nrow(re)) {
-      subj_id <- rownames(re)[i]
-      indiv_fe <- fe
-      for (nm in names(re)) {
-        indiv_fe[nm] <- indiv_fe[nm] + re[i, nm]
-      }
-      ip <- extract_1comp_params(indiv_fe, dose, is_iv)
-      ip$ID <- subj_id
-      indiv_list[[i]] <- ip
+  # Select extraction function based on model type
+  extract_fn <- switch(model_type,
+    "1comp" = extract_1comp_params,
+    "2comp" = extract_2comp_params,
+    "3comp" = extract_3comp_params
+  )
+
+  # Population parameters (with SE/CI)
+  pop_params <- extract_fn(fe, dose, is_iv, vcov_mat, df_resid)
+
+  # Individual parameters in wide format (one row per subject, parameter names as columns)
+  indiv_list <- list()
+  for (i in 1:nrow(re)) {
+    subj_id <- rownames(re)[i]
+    indiv_fe <- fe
+    for (nm in names(re)) {
+      indiv_fe[nm] <- indiv_fe[nm] + re[i, nm]
     }
-    indiv_df <- do.call(rbind, lapply(indiv_list, as.data.frame, stringsAsFactors = FALSE))
-  } else if (model_type == "2comp") {
-    pop_params <- extract_2comp_params(fe, dose, is_iv, vcov_mat, df_resid)
-    indiv_list <- list()
-    for (i in 1:nrow(re)) {
-      subj_id <- rownames(re)[i]
-      indiv_fe <- fe
-      for (nm in names(re)) {
-        indiv_fe[nm] <- indiv_fe[nm] + re[i, nm]
-      }
-      ip <- extract_2comp_params(indiv_fe, dose, is_iv)
-      ip$ID <- subj_id
-      indiv_list[[i]] <- ip
-    }
-    indiv_df <- do.call(rbind, lapply(indiv_list, as.data.frame, stringsAsFactors = FALSE))
-  } else if (model_type == "3comp") {
-    pop_params <- extract_3comp_params(fe, dose, is_iv, vcov_mat, df_resid)
-    indiv_list <- list()
-    for (i in 1:nrow(re)) {
-      subj_id <- rownames(re)[i]
-      indiv_fe <- fe
-      for (nm in names(re)) {
-        indiv_fe[nm] <- indiv_fe[nm] + re[i, nm]
-      }
-      ip <- extract_3comp_params(indiv_fe, dose, is_iv)
-      ip$ID <- subj_id
-      indiv_list[[i]] <- ip
-    }
-    indiv_df <- do.call(rbind, lapply(indiv_list, as.data.frame, stringsAsFactors = FALSE))
+    ip <- extract_fn(indiv_fe, dose, is_iv)
+    row_df <- as.data.frame(as.list(setNames(ip$Estimate, ip$Parameter)),
+                            check.names = FALSE, stringsAsFactors = FALSE)
+    row_df$ID <- subj_id
+    indiv_list[[i]] <- row_df
   }
+  indiv_df <- do.call(rbind, indiv_list)
 
   # Add model diagnostics
   pop_params$AIC <- AIC(fit)
