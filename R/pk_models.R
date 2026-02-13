@@ -273,25 +273,60 @@ fit_compartmental_model <- function(df, dose, model_type, route) {
   # Get initial estimates
   init_params <- estimate_initial_params(df, dose, model_type, route)
 
-  # Build the model
-  tryCatch({
+  # Build the model - try full random effects first, fall back to reduced
+  fit <- NULL
+  fit_error <- NULL
+
+  # Attempt 1: Full random effects (lCL + lV1 ~ 1 | ID)
+  fit <- tryCatch({
     if (model_type == "1comp" && is_iv) {
-      fit <- fit_1comp_iv(pk_data, init_params)
+      fit_1comp_iv(pk_data, init_params)
     } else if (model_type == "1comp" && !is_iv) {
-      fit <- fit_1comp_ev(pk_data, init_params)
+      fit_1comp_ev(pk_data, init_params)
     } else if (model_type == "2comp" && is_iv) {
-      fit <- fit_2comp_iv(pk_data, init_params)
+      fit_2comp_iv(pk_data, init_params)
     } else if (model_type == "2comp" && !is_iv) {
-      fit <- fit_2comp_ev(pk_data, init_params)
+      fit_2comp_ev(pk_data, init_params)
     } else if (model_type == "3comp" && is_iv) {
-      fit <- fit_3comp_iv(pk_data, init_params)
+      fit_3comp_iv(pk_data, init_params)
     } else if (model_type == "3comp" && !is_iv) {
-      fit <- fit_3comp_ev(pk_data, init_params)
+      fit_3comp_ev(pk_data, init_params)
     }
+  }, error = function(e) {
+    fit_error <<- e$message
+    NULL
+  })
 
-    # Extract parameters
+  # Attempt 2: Reduced random effects (lCL ~ 1 | ID) for 2comp/3comp
+  if (is.null(fit) && model_type %in% c("2comp", "3comp")) {
+    message("Full model failed, trying reduced random effects...")
+    fit <- tryCatch({
+      if (model_type == "2comp" && is_iv) {
+        fit_2comp_iv_reduced(pk_data, init_params)
+      } else if (model_type == "2comp" && !is_iv) {
+        fit_2comp_ev_reduced(pk_data, init_params)
+      } else if (model_type == "3comp" && is_iv) {
+        fit_3comp_iv_reduced(pk_data, init_params)
+      } else if (model_type == "3comp" && !is_iv) {
+        fit_3comp_ev_reduced(pk_data, init_params)
+      }
+    }, error = function(e) {
+      fit_error <<- e$message
+      NULL
+    })
+  }
+
+  if (is.null(fit)) {
+    return(list(
+      fit = NULL, params = NULL, summary = NULL, predictions = NULL,
+      error = paste("Model fitting failed:", fit_error,
+                    "\nTry a simpler model or check your data quality.")
+    ))
+  }
+
+  # Extract parameters
+  tryCatch({
     params <- extract_compartmental_params(fit, model_type, route, dose)
-
     return(list(
       fit = fit,
       params = params$individual,
@@ -301,12 +336,9 @@ fit_compartmental_model <- function(df, dose, model_type, route) {
     ))
   }, error = function(e) {
     return(list(
-      fit = NULL,
-      params = NULL,
-      summary = NULL,
-      predictions = NULL,
-      error = paste("Model fitting failed:", e$message,
-                    "\nTry a simpler model or check your data quality.")
+      fit = NULL, params = NULL, summary = NULL, predictions = NULL,
+      error = paste("Parameter extraction failed:", e$message,
+                    "\nThe model may have converged to invalid estimates. Try a simpler model.")
     ))
   })
 }
@@ -325,15 +357,18 @@ fit_1comp_iv <- function(data, inits) {
   )
 }
 
+#' One-compartment extravascular prediction function
+.pred_1comp_ev <- function(lV, lk, lka, Time, Dose) {
+  v <- exp(lV); k <- exp(lk); ka <- exp(lka)
+  dka <- ka - k
+  dka <- ifelse(abs(dka) < 1e-10, 1e-10, dka)
+  (Dose * ka / (v * dka)) * (exp(-k * Time) - exp(-ka * Time))
+}
+
 #' Fit one-compartment extravascular model
 fit_1comp_ev <- function(data, inits) {
   nlme(
-    Conc ~ {
-      V <- exp(lV); k <- exp(lk); ka <- exp(lka)
-      ifelse(abs(ka - k) < 1e-10,
-             (Dose / V) * k * Time * exp(-k * Time),
-             (Dose * ka / (V * (ka - k))) * (exp(-k * Time) - exp(-ka * Time)))
-    },
+    Conc ~ .pred_1comp_ev(lV, lk, lka, Time, Dose),
     data = data,
     fixed = lV + lk + lka ~ 1,
     random = lV + lk ~ 1 | ID,
@@ -344,19 +379,27 @@ fit_1comp_ev <- function(data, inits) {
   )
 }
 
+#' Two-compartment IV prediction function
+#' Defined at module level for reliable nlme formula evaluation
+.pred_2comp_iv <- function(lCL, lV1, lQ, lV2, Time, Dose) {
+  cl <- exp(lCL); v1 <- exp(lV1); q <- exp(lQ); v2 <- exp(lV2)
+  k10 <- cl / v1; k12 <- q / v1; k21 <- q / v2
+  ss <- k10 + k12 + k21
+  disc <- ss^2 - 4 * k10 * k21
+  disc <- ifelse(disc < 0, 1e-20, disc)
+  dd <- sqrt(disc)
+  alpha <- 0.5 * (ss + dd); beta <- 0.5 * (ss - dd)
+  dab <- alpha - beta
+  dab <- ifelse(abs(dab) < 1e-20, 1e-20, dab)
+  A <- (Dose / v1) * (alpha - k21) / dab
+  B <- (Dose / v1) * (k21 - beta) / dab
+  A * exp(-alpha * Time) + B * exp(-beta * Time)
+}
+
 #' Fit two-compartment IV model
 fit_2comp_iv <- function(data, inits) {
   nlme(
-    Conc ~ {
-      CL <- exp(lCL); V1 <- exp(lV1); Q <- exp(lQ); V2 <- exp(lV2)
-      k10 <- CL / V1; k12 <- Q / V1; k21 <- Q / V2
-      ss <- k10 + k12 + k21
-      dd <- sqrt(ss^2 - 4 * k10 * k21)
-      alpha <- 0.5 * (ss + dd); beta <- 0.5 * (ss - dd)
-      A <- (Dose / V1) * (alpha - k21) / (alpha - beta)
-      B <- (Dose / V1) * (k21 - beta) / (alpha - beta)
-      A * exp(-alpha * Time) + B * exp(-beta * Time)
-    },
+    Conc ~ .pred_2comp_iv(lCL, lV1, lQ, lV2, Time, Dose),
     data = data,
     fixed = lCL + lV1 + lQ + lV2 ~ 1,
     random = lCL + lV1 ~ 1 | ID,
@@ -367,20 +410,46 @@ fit_2comp_iv <- function(data, inits) {
   )
 }
 
+#' Fit two-compartment IV model with reduced random effects (fallback)
+fit_2comp_iv_reduced <- function(data, inits) {
+  nlme(
+    Conc ~ .pred_2comp_iv(lCL, lV1, lQ, lV2, Time, Dose),
+    data = data,
+    fixed = lCL + lV1 + lQ + lV2 ~ 1,
+    random = lCL ~ 1 | ID,
+    start = c(lCL = inits$lCL, lV1 = inits$lV1, lQ = inits$lQ, lV2 = inits$lV2),
+    control = nlmeControl(maxIter = 200, pnlsTol = 0.5, msMaxIter = 200,
+                          returnObject = TRUE),
+    na.action = na.omit
+  )
+}
+
+#' Two-compartment extravascular prediction function
+.pred_2comp_ev <- function(lCL, lV1, lQ, lV2, lka, Time, Dose) {
+  cl <- exp(lCL); v1 <- exp(lV1); q <- exp(lQ); v2 <- exp(lV2); ka <- exp(lka)
+  k10 <- cl / v1; k12 <- q / v1; k21 <- q / v2
+  ss <- k10 + k12 + k21
+  disc <- ss^2 - 4 * k10 * k21
+  disc <- ifelse(disc < 0, 1e-20, disc)
+  dd <- sqrt(disc)
+  alpha <- 0.5 * (ss + dd); beta <- 0.5 * (ss - dd)
+  d_ka_a <- ka - alpha; d_ka_a <- ifelse(abs(d_ka_a) < 1e-20, 1e-20, d_ka_a)
+  d_ka_b <- ka - beta;  d_ka_b <- ifelse(abs(d_ka_b) < 1e-20, 1e-20, d_ka_b)
+  d_ba   <- beta - alpha; d_ba <- ifelse(abs(d_ba) < 1e-20, 1e-20, d_ba)
+  d_ab   <- -d_ba
+  d_ak   <- alpha - ka; d_ak <- ifelse(abs(d_ak) < 1e-20, 1e-20, d_ak)
+  d_bk   <- beta - ka;  d_bk <- ifelse(abs(d_bk) < 1e-20, 1e-20, d_bk)
+  coeff <- Dose * ka / v1
+  A_c <- coeff * (k21 - alpha) / (d_ka_a * d_ba)
+  B_c <- coeff * (k21 - beta)  / (d_ka_b * d_ab)
+  C_c <- coeff * (k21 - ka)    / (d_ak * d_bk)
+  A_c * exp(-alpha * Time) + B_c * exp(-beta * Time) + C_c * exp(-ka * Time)
+}
+
 #' Fit two-compartment extravascular model
 fit_2comp_ev <- function(data, inits) {
   nlme(
-    Conc ~ {
-      CL <- exp(lCL); V1 <- exp(lV1); Q <- exp(lQ); V2 <- exp(lV2); ka <- exp(lka)
-      k10 <- CL / V1; k12 <- Q / V1; k21 <- Q / V2
-      ss <- k10 + k12 + k21
-      dd <- sqrt(ss^2 - 4 * k10 * k21)
-      alpha <- 0.5 * (ss + dd); beta <- 0.5 * (ss - dd)
-      A_c <- (Dose * ka / V1) * (k21 - alpha) / ((ka - alpha) * (beta - alpha))
-      B_c <- (Dose * ka / V1) * (k21 - beta) / ((ka - beta) * (alpha - beta))
-      C_c <- (Dose * ka / V1) * (k21 - ka) / ((alpha - ka) * (beta - ka))
-      A_c * exp(-alpha * Time) + B_c * exp(-beta * Time) + C_c * exp(-ka * Time)
-    },
+    Conc ~ .pred_2comp_ev(lCL, lV1, lQ, lV2, lka, Time, Dose),
     data = data,
     fixed = lCL + lV1 + lQ + lV2 + lka ~ 1,
     random = lCL + lV1 ~ 1 | ID,
@@ -392,33 +461,56 @@ fit_2comp_ev <- function(data, inits) {
   )
 }
 
+#' Fit two-compartment extravascular model with reduced random effects (fallback)
+fit_2comp_ev_reduced <- function(data, inits) {
+  nlme(
+    Conc ~ .pred_2comp_ev(lCL, lV1, lQ, lV2, lka, Time, Dose),
+    data = data,
+    fixed = lCL + lV1 + lQ + lV2 + lka ~ 1,
+    random = lCL ~ 1 | ID,
+    start = c(lCL = inits$lCL, lV1 = inits$lV1, lQ = inits$lQ,
+              lV2 = inits$lV2, lka = inits$lka),
+    control = nlmeControl(maxIter = 200, pnlsTol = 0.5, msMaxIter = 200,
+                          returnObject = TRUE),
+    na.action = na.omit
+  )
+}
+
+#' Three-compartment IV prediction function
+.pred_3comp_iv <- function(lCL, lV1, lQ2, lV2, lQ3, lV3, Time, Dose) {
+  cl <- exp(lCL); v1 <- exp(lV1); q2 <- exp(lQ2); v2 <- exp(lV2)
+  q3 <- exp(lQ3); v3 <- exp(lV3)
+  k10 <- cl / v1; k12 <- q2 / v1; k21 <- q2 / v2
+  k13 <- q3 / v1; k31 <- q3 / v3
+  a0 <- k10 * k21 * k31
+  a1 <- k10 * k31 + k21 * k31 + k21 * k13 + k10 * k21 + k31 * k12
+  a2 <- k10 + k12 + k13 + k21 + k31
+  pp <- a1 - (a2^2) / 3
+  qq <- (2 * a2^3 / 27) - (a1 * a2 / 3) + a0
+  r1 <- (-(pp^3) / 27)^0.5
+  phi <- acos(pmin(pmax(-qq / (2 * r1 + 1e-20), -1), 1)) / 3
+  r1c <- r1^(1/3)
+  rr1 <- -(cos(phi) * 2 * r1c - a2 / 3)
+  rr2 <- -(cos(phi + 2 * pi / 3) * 2 * r1c - a2 / 3)
+  rr3 <- -(cos(phi + 4 * pi / 3) * 2 * r1c - a2 / 3)
+  alpha <- pmax(rr1, pmax(rr2, rr3))
+  gamma <- pmin(rr1, pmin(rr2, rr3))
+  beta <- rr1 + rr2 + rr3 - alpha - gamma
+  d_ba <- beta - alpha; d_ba <- ifelse(abs(d_ba) < 1e-20, 1e-20, d_ba)
+  d_ga <- gamma - alpha; d_ga <- ifelse(abs(d_ga) < 1e-20, 1e-20, d_ga)
+  d_ab <- -d_ba
+  d_gb <- gamma - beta; d_gb <- ifelse(abs(d_gb) < 1e-20, 1e-20, d_gb)
+  d_ag <- -d_ga; d_bg <- -d_gb
+  A <- (Dose / v1) * ((k21 - alpha) * (k31 - alpha)) / (d_ba * d_ga)
+  B <- (Dose / v1) * ((k21 - beta) * (k31 - beta)) / (d_ab * d_gb)
+  Cc <- (Dose / v1) * ((k21 - gamma) * (k31 - gamma)) / (d_ag * d_bg)
+  A * exp(-alpha * Time) + B * exp(-beta * Time) + Cc * exp(-gamma * Time)
+}
+
 #' Fit three-compartment IV model
 fit_3comp_iv <- function(data, inits) {
   nlme(
-    Conc ~ {
-      CL <- exp(lCL); V1 <- exp(lV1); Q2 <- exp(lQ2); V2 <- exp(lV2)
-      Q3 <- exp(lQ3); V3 <- exp(lV3)
-      k10 <- CL / V1; k12 <- Q2 / V1; k21 <- Q2 / V2
-      k13 <- Q3 / V1; k31 <- Q3 / V3
-      a0 <- k10 * k21 * k31
-      a1 <- k10 * k31 + k21 * k31 + k21 * k13 + k10 * k21 + k31 * k12
-      a2 <- k10 + k12 + k13 + k21 + k31
-      pp <- a1 - (a2^2) / 3
-      qq <- (2 * a2^3 / 27) - (a1 * a2 / 3) + a0
-      r1 <- (-(pp^3) / 27)^0.5
-      phi <- acos(-qq / (2 * r1)) / 3
-      r1c <- r1^(1/3)
-      rr1 <- -(cos(phi) * 2 * r1c - a2 / 3)
-      rr2 <- -(cos(phi + 2 * pi / 3) * 2 * r1c - a2 / 3)
-      rr3 <- -(cos(phi + 4 * pi / 3) * 2 * r1c - a2 / 3)
-      alpha <- max(rr1, rr2, rr3)
-      gamma <- min(rr1, rr2, rr3)
-      beta <- rr1 + rr2 + rr3 - alpha - gamma
-      A <- (Dose / V1) * ((k21 - alpha) * (k31 - alpha)) / ((beta - alpha) * (gamma - alpha))
-      B <- (Dose / V1) * ((k21 - beta) * (k31 - beta)) / ((alpha - beta) * (gamma - beta))
-      C <- (Dose / V1) * ((k21 - gamma) * (k31 - gamma)) / ((alpha - gamma) * (beta - gamma))
-      A * exp(-alpha * Time) + B * exp(-beta * Time) + C * exp(-gamma * Time)
-    },
+    Conc ~ .pred_3comp_iv(lCL, lV1, lQ2, lV2, lQ3, lV3, Time, Dose),
     data = data,
     fixed = lCL + lV1 + lQ2 + lV2 + lQ3 + lV3 ~ 1,
     random = lCL + lV1 ~ 1 | ID,
@@ -430,40 +522,75 @@ fit_3comp_iv <- function(data, inits) {
   )
 }
 
+#' Fit three-compartment IV model with reduced random effects (fallback)
+fit_3comp_iv_reduced <- function(data, inits) {
+  nlme(
+    Conc ~ .pred_3comp_iv(lCL, lV1, lQ2, lV2, lQ3, lV3, Time, Dose),
+    data = data,
+    fixed = lCL + lV1 + lQ2 + lV2 + lQ3 + lV3 ~ 1,
+    random = lCL ~ 1 | ID,
+    start = c(lCL = inits$lCL, lV1 = inits$lV1, lQ2 = inits$lQ2,
+              lV2 = inits$lV2, lQ3 = inits$lQ3, lV3 = inits$lV3),
+    control = nlmeControl(maxIter = 200, pnlsTol = 0.5, msMaxIter = 200,
+                          returnObject = TRUE),
+    na.action = na.omit
+  )
+}
+
+#' Three-compartment extravascular prediction function
+.pred_3comp_ev <- function(lCL, lV1, lQ2, lV2, lQ3, lV3, lka, Time, Dose) {
+  cl <- exp(lCL); v1 <- exp(lV1); q2 <- exp(lQ2); v2 <- exp(lV2)
+  q3 <- exp(lQ3); v3 <- exp(lV3); ka <- exp(lka)
+  k10 <- cl / v1; k12 <- q2 / v1; k21 <- q2 / v2
+  k13 <- q3 / v1; k31 <- q3 / v3
+  a0 <- k10 * k21 * k31
+  a1 <- k10 * k31 + k21 * k31 + k21 * k13 + k10 * k21 + k31 * k12
+  a2 <- k10 + k12 + k13 + k21 + k31
+  pp <- a1 - (a2^2) / 3
+  qq <- (2 * a2^3 / 27) - (a1 * a2 / 3) + a0
+  r1 <- (-(pp^3) / 27)^0.5
+  phi <- acos(pmin(pmax(-qq / (2 * r1 + 1e-20), -1), 1)) / 3
+  r1c <- r1^(1/3)
+  rr1 <- -(cos(phi) * 2 * r1c - a2 / 3)
+  rr2 <- -(cos(phi + 2 * pi / 3) * 2 * r1c - a2 / 3)
+  rr3 <- -(cos(phi + 4 * pi / 3) * 2 * r1c - a2 / 3)
+  alpha <- pmax(rr1, pmax(rr2, rr3))
+  gamma <- pmin(rr1, pmin(rr2, rr3))
+  beta <- rr1 + rr2 + rr3 - alpha - gamma
+  safe_div <- function(x) ifelse(abs(x) < 1e-20, 1e-20, x)
+  coeff <- Dose * ka / v1
+  A_c <- coeff * ((k21 - alpha) * (k31 - alpha)) / (safe_div(beta - alpha) * safe_div(gamma - alpha) * safe_div(ka - alpha))
+  B_c <- coeff * ((k21 - beta) * (k31 - beta)) / (safe_div(alpha - beta) * safe_div(gamma - beta) * safe_div(ka - beta))
+  C_c <- coeff * ((k21 - gamma) * (k31 - gamma)) / (safe_div(alpha - gamma) * safe_div(beta - gamma) * safe_div(ka - gamma))
+  D_c <- coeff * ((k21 - ka) * (k31 - ka)) / (safe_div(alpha - ka) * safe_div(beta - ka) * safe_div(gamma - ka))
+  A_c * exp(-alpha * Time) + B_c * exp(-beta * Time) + C_c * exp(-gamma * Time) + D_c * exp(-ka * Time)
+}
+
 #' Fit three-compartment extravascular model
 fit_3comp_ev <- function(data, inits) {
   nlme(
-    Conc ~ {
-      CL <- exp(lCL); V1 <- exp(lV1); Q2 <- exp(lQ2); V2 <- exp(lV2)
-      Q3 <- exp(lQ3); V3 <- exp(lV3); ka <- exp(lka)
-      k10 <- CL / V1; k12 <- Q2 / V1; k21 <- Q2 / V2
-      k13 <- Q3 / V1; k31 <- Q3 / V3
-      a0 <- k10 * k21 * k31
-      a1 <- k10 * k31 + k21 * k31 + k21 * k13 + k10 * k21 + k31 * k12
-      a2 <- k10 + k12 + k13 + k21 + k31
-      pp <- a1 - (a2^2) / 3
-      qq <- (2 * a2^3 / 27) - (a1 * a2 / 3) + a0
-      r1 <- (-(pp^3) / 27)^0.5
-      phi <- acos(-qq / (2 * r1)) / 3
-      r1c <- r1^(1/3)
-      rr1 <- -(cos(phi) * 2 * r1c - a2 / 3)
-      rr2 <- -(cos(phi + 2 * pi / 3) * 2 * r1c - a2 / 3)
-      rr3 <- -(cos(phi + 4 * pi / 3) * 2 * r1c - a2 / 3)
-      alpha <- max(rr1, rr2, rr3)
-      gamma <- min(rr1, rr2, rr3)
-      beta <- rr1 + rr2 + rr3 - alpha - gamma
-      A_c <- (Dose * ka / V1) * ((k21 - alpha) * (k31 - alpha)) / ((beta - alpha) * (gamma - alpha) * (ka - alpha))
-      B_c <- (Dose * ka / V1) * ((k21 - beta) * (k31 - beta)) / ((alpha - beta) * (gamma - beta) * (ka - beta))
-      C_c <- (Dose * ka / V1) * ((k21 - gamma) * (k31 - gamma)) / ((alpha - gamma) * (beta - gamma) * (ka - gamma))
-      D_c <- (Dose * ka / V1) * ((k21 - ka) * (k31 - ka)) / ((alpha - ka) * (beta - ka) * (gamma - ka))
-      A_c * exp(-alpha * Time) + B_c * exp(-beta * Time) + C_c * exp(-gamma * Time) + D_c * exp(-ka * Time)
-    },
+    Conc ~ .pred_3comp_ev(lCL, lV1, lQ2, lV2, lQ3, lV3, lka, Time, Dose),
     data = data,
     fixed = lCL + lV1 + lQ2 + lV2 + lQ3 + lV3 + lka ~ 1,
     random = lCL + lV1 ~ 1 | ID,
     start = c(lCL = inits$lCL, lV1 = inits$lV1, lQ2 = inits$lQ2,
               lV2 = inits$lV2, lQ3 = inits$lQ3, lV3 = inits$lV3, lka = inits$lka),
     control = nlmeControl(maxIter = 200, pnlsTol = 0.1, msMaxIter = 200,
+                          returnObject = TRUE),
+    na.action = na.omit
+  )
+}
+
+#' Fit three-compartment extravascular model with reduced random effects (fallback)
+fit_3comp_ev_reduced <- function(data, inits) {
+  nlme(
+    Conc ~ .pred_3comp_ev(lCL, lV1, lQ2, lV2, lQ3, lV3, lka, Time, Dose),
+    data = data,
+    fixed = lCL + lV1 + lQ2 + lV2 + lQ3 + lV3 + lka ~ 1,
+    random = lCL ~ 1 | ID,
+    start = c(lCL = inits$lCL, lV1 = inits$lV1, lQ2 = inits$lQ2,
+              lV2 = inits$lV2, lQ3 = inits$lQ3, lV3 = inits$lV3, lka = inits$lka),
+    control = nlmeControl(maxIter = 200, pnlsTol = 0.5, msMaxIter = 200,
                           returnObject = TRUE),
     na.action = na.omit
   )
