@@ -52,20 +52,20 @@ plot_mean_conc_time <- function(df, log_y = FALSE, species = "", drug_name = "",
 
   if (show_ci) {
     p <- p +
-      geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.2, fill = fill_col) +
-      geom_errorbar(aes(ymin = Lower, ymax = Upper),
-                    width = max(diff(range(summary_df$Time))) * 0.015,
-                    color = line_col, linewidth = 0.5)
+      geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.2, fill = fill_col)
   }
 
   p <- p +
+    geom_errorbar(aes(ymin = Lower, ymax = Upper),
+                  width = max(diff(range(summary_df$Time))) * 0.015,
+                  color = line_col, linewidth = 0.5) +
     geom_line(color = line_col, linewidth = 1) +
-    geom_point(color = line_col, size = 2.5, shape = if (is_bw) 16 else 16) +
+    geom_point(color = line_col, size = 2.5) +
     labs(
       title = plot_title,
       x = paste0("Time (", time_unit, ")"),
       y = paste0("Concentration (", conc_unit, ")"),
-      caption = paste("Mean", if (show_ci) "\u00B1 SEM" else "", ", n =", max(summary_df$N))
+      caption = paste("Mean \u00B1 SEM, n =", max(summary_df$N))
     ) +
     theme_bw(base_size = 14) +
     theme(
@@ -208,9 +208,12 @@ plot_model_fit <- function(df, predictions, log_y = FALSE, model_label = "",
 #' @param df Original data
 #' @return List of ggplot objects
 plot_diagnostics <- function(fit, df) {
-  # Get fitted values and residuals
+  # Get fitted values and residuals (handle both nlme and gnls)
   fitted_vals <- fitted(fit)
-  resid_vals <- residuals(fit, type = "normalized")
+  resid_vals <- tryCatch(
+    residuals(fit, type = "normalized"),
+    error = function(e) residuals(fit) / sd(residuals(fit))
+  )
   observed <- df$Conc[!is.na(df$Conc)]
 
   # Trim to same length

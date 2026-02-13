@@ -194,7 +194,7 @@ ui <- fluidPage(
                                         inline = FALSE, selected = "mean")),
                 column(3,
                   checkboxInput("log_y_obs", "Log-transformed Y-axis", value = FALSE),
-                  checkboxInput("show_ci", "Show SEM shading", value = TRUE)
+                  checkboxInput("show_ci", "Show confidence shading", value = TRUE)
                 ),
                 column(3,
                   radioButtons("color_mode", "Color Scheme",

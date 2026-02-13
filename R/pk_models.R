@@ -364,8 +364,11 @@ curve_strip_iv <- function(time, conc, dose, model_type) {
 
 #' Fit a compartmental model using nlme with robust multi-level fallback
 #'
-#' Strategy: tries progressively simpler random-effects structures
-#' and more relaxed convergence controls until one succeeds.
+#' Strategy:
+#' 1. Try per-subject nls fits to get better starting values
+#' 2. Try nlme with progressively simpler random-effects structures
+#' 3. Try nlme with varPower() error model (PK data often has proportional error)
+#' 4. Fall back to gnls (no random effects) as last resort
 #'
 #' @param df Data frame with ID, Time, Conc columns
 #' @param dose Numeric dose
@@ -383,10 +386,19 @@ fit_compartmental_model <- function(df, dose, model_type, route) {
   # Get initial estimates (uses curve stripping for IV multi-compartment)
   init_params <- estimate_initial_params(df, dose, model_type, route)
 
+  # Try to refine starting values with per-subject nls fits
+  refined <- tryCatch(
+    refine_inits_with_nls(pk_data, init_params, model_type, is_iv),
+    error = function(e) NULL
+  )
+  if (!is.null(refined)) {
+    init_params <- refined
+  }
+
   # Build list of fitting attempts (progressively more relaxed)
   fit <- NULL
-  fit_error <- NULL
   last_error <- ""
+  used_gnls <- FALSE
 
   # Define control levels: progressively more relaxed
   ctrl_strict <- nlmeControl(maxIter = 200, pnlsTol = 0.01, msMaxIter = 200,
@@ -398,7 +410,7 @@ fit_compartmental_model <- function(df, dose, model_type, route) {
   ctrl_very_relaxed <- nlmeControl(maxIter = 500, pnlsTol = 2.0, msMaxIter = 500,
                                     tolerance = 1e-2, returnObject = TRUE, opt = "nlm")
 
-  # Build attempt list based on model type
+  # --- Phase 1: standard nlme attempts ---
   attempts <- build_fitting_attempts(model_type, is_iv,
                                       ctrl_strict, ctrl_medium, ctrl_relaxed, ctrl_very_relaxed)
 
@@ -412,6 +424,34 @@ fit_compartmental_model <- function(df, dose, model_type, route) {
     if (!is.null(fit)) break
   }
 
+  # --- Phase 2: nlme with varPower() error model ---
+  if (is.null(fit)) {
+    for (re_type in c("re_cl_only", "re_v1_only", "re_v_only", "re_k_only")) {
+      # skip irrelevant re types for the model
+      if (model_type == "1comp" && re_type %in% c("re_cl_only", "re_v1_only")) next
+      if (model_type != "1comp" && re_type %in% c("re_v_only", "re_k_only")) next
+
+      fit <- tryCatch({
+        do_nlme_fit_varpower(pk_data, init_params, model_type, is_iv, re_type, ctrl_relaxed)
+      }, error = function(e) {
+        last_error <<- e$message
+        NULL
+      })
+      if (!is.null(fit)) break
+    }
+  }
+
+  # --- Phase 3: gnls fallback (no random effects, population-level only) ---
+  if (is.null(fit)) {
+    fit <- tryCatch({
+      do_gnls_fit(pk_data, init_params, model_type, is_iv)
+    }, error = function(e) {
+      last_error <<- e$message
+      NULL
+    })
+    if (!is.null(fit)) used_gnls <- TRUE
+  }
+
   if (is.null(fit)) {
     return(list(
       fit = NULL, params = NULL, summary = NULL, predictions = NULL,
@@ -422,12 +462,21 @@ fit_compartmental_model <- function(df, dose, model_type, route) {
 
   # Extract parameters
   tryCatch({
-    params <- extract_compartmental_params(fit, model_type, route, dose)
+    if (used_gnls) {
+      params <- extract_gnls_params(fit, model_type, route, dose, pk_data)
+    } else {
+      params <- extract_compartmental_params(fit, model_type, route, dose)
+    }
+    preds <- if (used_gnls) {
+      generate_gnls_predictions(fit, pk_data, model_type, route, dose)
+    } else {
+      generate_predictions(fit, pk_data, model_type, route, dose)
+    }
     return(list(
       fit = fit,
       params = params$individual,
       summary = params$population,
-      predictions = generate_predictions(fit, pk_data, model_type, route, dose),
+      predictions = preds,
       error = NULL
     ))
   }, error = function(e) {
@@ -437,6 +486,56 @@ fit_compartmental_model <- function(df, dose, model_type, route) {
                     "\nThe model may have converged to invalid estimates. Try a simpler model.")
     ))
   })
+}
+
+#' Refine starting values by fitting nls to each subject individually
+refine_inits_with_nls <- function(data, inits, model_type, is_iv) {
+  subjects <- unique(data$ID)
+  all_params <- list()
+
+  pred_fn <- get_pred_function_nls(model_type, is_iv)
+  start_list <- as.list(unlist(inits))
+
+  for (subj in subjects) {
+    sdata <- data[data$ID == subj, ]
+    subj_fit <- tryCatch({
+      nls(Conc ~ pred_fn(params, Time, Dose),
+          data = sdata,
+          start = list(params = unlist(start_list)),
+          algorithm = "port",
+          lower = rep(-20, length(start_list)),
+          upper = rep(20, length(start_list)),
+          control = nls.control(maxiter = 100, warnOnly = TRUE))
+    }, error = function(e) NULL)
+
+    if (!is.null(subj_fit)) {
+      all_params[[length(all_params) + 1]] <- coef(subj_fit)
+    }
+  }
+
+  if (length(all_params) < 2) return(NULL)
+
+  # Use median of per-subject estimates
+  param_mat <- do.call(rbind, all_params)
+  median_params <- apply(param_mat, 2, median)
+  as.list(setNames(median_params, names(inits)))
+}
+
+#' Get a prediction function wrapper for nls fitting
+get_pred_function_nls <- function(model_type, is_iv) {
+  if (model_type == "1comp" && is_iv) {
+    function(p, Time, Dose) (Dose / exp(p[1])) * exp(-exp(p[2]) * Time)
+  } else if (model_type == "1comp" && !is_iv) {
+    function(p, Time, Dose) .pred_1comp_ev(p[1], p[2], p[3], Time, Dose)
+  } else if (model_type == "2comp" && is_iv) {
+    function(p, Time, Dose) .pred_2comp_iv(p[1], p[2], p[3], p[4], Time, Dose)
+  } else if (model_type == "2comp" && !is_iv) {
+    function(p, Time, Dose) .pred_2comp_ev(p[1], p[2], p[3], p[4], p[5], Time, Dose)
+  } else if (model_type == "3comp" && is_iv) {
+    function(p, Time, Dose) .pred_3comp_iv(p[1], p[2], p[3], p[4], p[5], p[6], Time, Dose)
+  } else {
+    function(p, Time, Dose) .pred_3comp_ev(p[1], p[2], p[3], p[4], p[5], p[6], p[7], Time, Dose)
+  }
 }
 
 #' Build list of fitting attempts with progressively simpler structures
@@ -557,6 +656,145 @@ do_nlme_fit <- function(data, inits, model_type, is_iv, attempt) {
          control = ctrl,
          na.action = na.omit)
   }
+}
+
+#' Execute nlme fit with varPower error model (better for heteroscedastic PK data)
+do_nlme_fit_varpower <- function(data, inits, model_type, is_iv, re_type, ctrl) {
+  specs <- get_model_specs(inits, model_type, is_iv)
+
+  random_form <- switch(re_type,
+    "re_cl_only" = lCL ~ 1 | ID,
+    "re_v1_only" = lV1 ~ 1 | ID,
+    "re_v_only"  = lV ~ 1 | ID,
+    "re_k_only"  = lk ~ 1 | ID
+  )
+
+  nlme(specs$formula,
+       data = data,
+       fixed = specs$fixed,
+       random = pdDiag(random_form),
+       start = specs$starts,
+       weights = varPower(form = ~fitted(.)),
+       control = ctrl,
+       na.action = na.omit)
+}
+
+#' Fit using gnls (no random effects - population-level only, last resort)
+do_gnls_fit <- function(data, inits, model_type, is_iv) {
+  specs <- get_model_specs(inits, model_type, is_iv)
+
+  ctrl <- gnlsControl(maxIter = 500, nlsTol = 0.01, tolerance = 1e-4,
+                       returnObject = TRUE)
+
+  # Try with default error, then varPower
+  fit <- tryCatch(
+    gnls(specs$formula, data = data, start = specs$starts,
+         control = ctrl, na.action = na.omit),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) {
+    fit <- gnls(specs$formula, data = data, start = specs$starts,
+                weights = varPower(form = ~fitted(.)),
+                control = ctrl, na.action = na.omit)
+  }
+
+  return(fit)
+}
+
+#' Helper to get model formula, fixed form, and start values
+get_model_specs <- function(inits, model_type, is_iv) {
+  if (model_type == "1comp" && is_iv) {
+    list(formula = Conc ~ (Dose / exp(lV)) * exp(-exp(lk) * Time),
+         fixed = lV + lk ~ 1,
+         starts = c(lV = inits$lV, lk = inits$lk))
+  } else if (model_type == "1comp" && !is_iv) {
+    list(formula = Conc ~ .pred_1comp_ev(lV, lk, lka, Time, Dose),
+         fixed = lV + lk + lka ~ 1,
+         starts = c(lV = inits$lV, lk = inits$lk, lka = inits$lka))
+  } else if (model_type == "2comp" && is_iv) {
+    list(formula = Conc ~ .pred_2comp_iv(lCL, lV1, lQ, lV2, Time, Dose),
+         fixed = lCL + lV1 + lQ + lV2 ~ 1,
+         starts = c(lCL = inits$lCL, lV1 = inits$lV1, lQ = inits$lQ, lV2 = inits$lV2))
+  } else if (model_type == "2comp" && !is_iv) {
+    list(formula = Conc ~ .pred_2comp_ev(lCL, lV1, lQ, lV2, lka, Time, Dose),
+         fixed = lCL + lV1 + lQ + lV2 + lka ~ 1,
+         starts = c(lCL = inits$lCL, lV1 = inits$lV1, lQ = inits$lQ,
+                    lV2 = inits$lV2, lka = inits$lka))
+  } else if (model_type == "3comp" && is_iv) {
+    list(formula = Conc ~ .pred_3comp_iv(lCL, lV1, lQ2, lV2, lQ3, lV3, Time, Dose),
+         fixed = lCL + lV1 + lQ2 + lV2 + lQ3 + lV3 ~ 1,
+         starts = c(lCL = inits$lCL, lV1 = inits$lV1, lQ2 = inits$lQ2,
+                    lV2 = inits$lV2, lQ3 = inits$lQ3, lV3 = inits$lV3))
+  } else {
+    list(formula = Conc ~ .pred_3comp_ev(lCL, lV1, lQ2, lV2, lQ3, lV3, lka, Time, Dose),
+         fixed = lCL + lV1 + lQ2 + lV2 + lQ3 + lV3 + lka ~ 1,
+         starts = c(lCL = inits$lCL, lV1 = inits$lV1, lQ2 = inits$lQ2,
+                    lV2 = inits$lV2, lQ3 = inits$lQ3, lV3 = inits$lV3, lka = inits$lka))
+  }
+}
+
+#' Extract parameters from gnls fit (no random effects, so no individual estimates)
+extract_gnls_params <- function(fit, model_type, route, dose, data) {
+  fe <- coef(fit)
+  is_iv <- toupper(route) == "IV"
+
+  if (model_type == "1comp") {
+    pop_params <- extract_1comp_params(fe, dose, is_iv)
+  } else if (model_type == "2comp") {
+    pop_params <- extract_2comp_params(fe, dose, is_iv)
+  } else {
+    pop_params <- extract_3comp_params(fe, dose, is_iv)
+  }
+
+  pop_params$AIC <- AIC(fit)
+  pop_params$BIC <- BIC(fit)
+  pop_params$logLik <- as.numeric(logLik(fit))
+
+  # For gnls, individual params = population params for each subject
+  subjects <- unique(data$ID)
+  indiv_list <- list()
+  for (subj in subjects) {
+    if (model_type == "1comp") {
+      ip <- extract_1comp_params(fe, dose, is_iv)
+    } else if (model_type == "2comp") {
+      ip <- extract_2comp_params(fe, dose, is_iv)
+    } else {
+      ip <- extract_3comp_params(fe, dose, is_iv)
+    }
+    ip$ID <- as.character(subj)
+    indiv_list[[length(indiv_list) + 1]] <- ip
+  }
+  indiv_df <- do.call(rbind, lapply(indiv_list, as.data.frame, stringsAsFactors = FALSE))
+
+  return(list(population = pop_params, individual = indiv_df))
+}
+
+#' Generate predictions from gnls fit
+generate_gnls_predictions <- function(fit, data, model_type, route, dose) {
+  time_range <- range(data$Time)
+  time_seq <- seq(time_range[1], time_range[2], length.out = 200)
+
+  fe <- coef(fit)
+  is_iv <- toupper(route) == "IV"
+
+  pop_pred <- predict_from_params(fe, time_seq, dose, model_type, is_iv)
+  pred_df <- data.frame(Time = time_seq, Pred_pop = pop_pred)
+
+  # For gnls, individual predictions = population predictions
+  subjects <- unique(data$ID)
+  indiv_preds <- list()
+  for (subj in subjects) {
+    indiv_preds[[as.character(subj)]] <- data.frame(
+      Time = time_seq,
+      Pred_indiv = pop_pred,
+      ID = as.character(subj),
+      stringsAsFactors = FALSE
+    )
+  }
+  indiv_df <- do.call(rbind, indiv_preds)
+
+  return(list(population = pred_df, individual = indiv_df))
 }
 
 #' Prediction functions for nlme formulas (must be at module level)
