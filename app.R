@@ -550,12 +550,16 @@ server <- function(input, output, session) {
 
     if (rv$analysis_type == "NCA") {
       # NCA Results
+      is_iv <- input$route %in% c("IV", "IV_INF")
       tagList(
         h4("Individual NCA Parameters", class = "section-title"),
         DTOutput("nca_individual_table"),
         br(),
         h4("Summary Statistics", class = "section-title"),
-        DTOutput("nca_summary_table")
+        DTOutput("nca_summary_table"),
+        br(),
+        h4("Parameter Guide", class = "section-title"),
+        uiOutput("nca_param_guide")
       )
     } else {
       # Compartmental Results
@@ -569,9 +573,131 @@ server <- function(input, output, session) {
         wellPanel(
           h5("Model Diagnostics"),
           uiOutput("model_info")
-        )
+        ),
+        br(),
+        h4("Parameter Guide", class = "section-title"),
+        uiOutput("comp_param_guide")
       )
     }
+  })
+
+  # ---- NCA Parameter Guide ----
+  output$nca_param_guide <- renderUI({
+    is_iv <- input$route %in% c("IV", "IV_INF")
+    cl_label <- if (is_iv) "CL" else "CL/F"
+    vd_label <- if (is_iv) "Vd" else "Vd/F"
+    vss_label <- if (is_iv) "Vss" else "Vss/F"
+
+    guide <- tags$table(
+      class = "table table-condensed table-striped",
+      style = "font-size: 12px;",
+      tags$thead(tags$tr(
+        tags$th("Parameter"), tags$th("Full Name"), tags$th("Interpretation")
+      )),
+      tags$tbody(
+        tags$tr(tags$td("Cmax"), tags$td("Maximum concentration"),
+                tags$td("Highest observed drug concentration in plasma")),
+        tags$tr(tags$td("Tmax"), tags$td("Time to maximum concentration"),
+                tags$td("Time at which Cmax occurs; reflects absorption rate for extravascular routes")),
+        tags$tr(tags$td("AUC_last"), tags$td("Area under the curve to last observation"),
+                tags$td("Total drug exposure from dosing to last measurable concentration")),
+        tags$tr(tags$td("AUC_inf"), tags$td("Area under the curve extrapolated to infinity"),
+                tags$td("Total drug exposure including extrapolated terminal phase")),
+        tags$tr(tags$td("AUC_extrap_pct"), tags$td("Percent AUC extrapolated"),
+                tags$td("Fraction of AUC_inf estimated by extrapolation; ideally < 20%")),
+        tags$tr(tags$td(HTML("&lambda;z")), tags$td("Terminal elimination rate constant"),
+                tags$td("Rate of drug elimination during the terminal log-linear phase")),
+        tags$tr(tags$td(HTML("t&frac12;")), tags$td("Terminal half-life"),
+                tags$td("Time for plasma concentration to decrease by 50% during terminal phase")),
+        tags$tr(tags$td(HTML("&lambda;z R&sup2;")), tags$td("Terminal phase R-squared"),
+                tags$td("Goodness of fit for terminal slope estimation; should be > 0.90")),
+        tags$tr(tags$td("MRT"), tags$td("Mean residence time"),
+                tags$td("Average time a drug molecule stays in the body")),
+        tags$tr(tags$td(cl_label), tags$td(if (is_iv) "Clearance" else "Apparent clearance"),
+                tags$td("Volume of plasma completely cleared of drug per unit time")),
+        tags$tr(tags$td(vd_label), tags$td(if (is_iv) "Volume of distribution" else "Apparent volume of distribution"),
+                tags$td("Theoretical volume needed to contain the total drug at the same concentration as plasma")),
+        tags$tr(tags$td(vss_label), tags$td(if (is_iv) "Volume of distribution at steady state" else "Apparent Vss"),
+                tags$td("Vd when drug distribution is at equilibrium between compartments"))
+      )
+    )
+    guide
+  })
+
+  # ---- Compartmental Parameter Guide ----
+  output$comp_param_guide <- renderUI({
+    is_iv <- input$route %in% c("IV", "IV_INF")
+    pref <- if (is_iv) "" else "/F"
+    model <- rv$analysis_type
+
+    if (model == "1comp") {
+      rows <- list(
+        tags$tr(tags$td(paste0("V", pref)), tags$td(if (is_iv) "Volume of distribution" else "Apparent volume"),
+                tags$td("Theoretical volume needed to contain the total drug at the same concentration as plasma")),
+        tags$tr(tags$td(paste0("CL", pref)), tags$td(if (is_iv) "Clearance" else "Apparent clearance"),
+                tags$td("Volume of plasma completely cleared of drug per unit time")),
+        tags$tr(tags$td("k"), tags$td("Elimination rate constant"),
+                tags$td("Fraction of drug eliminated per unit time")),
+        tags$tr(tags$td(HTML("t&frac12;")), tags$td("Half-life"),
+                tags$td("Time for plasma concentration to decrease by 50%"))
+      )
+    } else {
+      rows <- list(
+        tags$tr(tags$td(paste0("CL", pref)), tags$td(if (is_iv) "Clearance" else "Apparent clearance"),
+                tags$td("Volume of plasma completely cleared of drug per unit time")),
+        tags$tr(tags$td(paste0("V1", pref)), tags$td(if (is_iv) "Central volume" else "Apparent central volume"),
+                tags$td("Volume of the central (plasma) compartment"))
+      )
+    }
+
+    if (model %in% c("2comp", "3comp")) {
+      rows <- c(rows, list(
+        tags$tr(tags$td(paste0("Q", pref)), tags$td(if (is_iv) "Inter-compartmental clearance" else "Apparent Q"),
+                tags$td("Rate of drug transfer between central and peripheral compartments")),
+        tags$tr(tags$td(paste0("V2", pref)), tags$td(if (is_iv) "Peripheral volume" else "Apparent peripheral volume"),
+                tags$td("Volume of the first peripheral (tissue) compartment")),
+        tags$tr(tags$td(paste0("Vss", pref)), tags$td(if (is_iv) "Volume at steady state" else "Apparent Vss"),
+                tags$td("Sum of all compartment volumes; total distribution volume at equilibrium"))
+      ))
+    }
+
+    if (model == "3comp") {
+      rows <- c(rows, list(
+        tags$tr(tags$td(paste0("Q3", pref)), tags$td("Deep inter-compartmental clearance"),
+                tags$td("Rate of drug transfer between central and deep peripheral compartment")),
+        tags$tr(tags$td(paste0("V3", pref)), tags$td("Deep peripheral volume"),
+                tags$td("Volume of the second (deep tissue) peripheral compartment"))
+      ))
+    }
+
+    if (model == "2comp") {
+      rows <- c(rows, list(
+        tags$tr(tags$td("Alpha"), tags$td("Distribution rate constant"),
+                tags$td("Rate of the rapid initial distribution phase")),
+        tags$tr(tags$td("Beta"), tags$td("Terminal elimination rate constant"),
+                tags$td("Rate of the slower terminal elimination phase")),
+        tags$tr(tags$td(HTML("t&frac12; alpha")), tags$td("Distribution half-life"),
+                tags$td("Half-life of the rapid distribution phase")),
+        tags$tr(tags$td(HTML("t&frac12; beta")), tags$td("Terminal half-life"),
+                tags$td("Half-life of the terminal elimination phase"))
+      ))
+    }
+
+    if (!is_iv) {
+      rows <- c(rows, list(
+        tags$tr(tags$td("ka"), tags$td("Absorption rate constant"),
+                tags$td("Rate at which drug is absorbed from the administration site into systemic circulation"))
+      ))
+    }
+
+    tags$table(
+      class = "table table-condensed table-striped",
+      style = "font-size: 12px;",
+      tags$thead(tags$tr(
+        tags$th("Parameter"), tags$th("Full Name"), tags$th("Interpretation")
+      )),
+      tags$tbody(rows)
+    )
   })
 
   # ---- NCA Tables ----
@@ -588,8 +714,11 @@ server <- function(input, output, session) {
   output$nca_summary_table <- renderDT({
     req(rv$nca_summary_results)
     datatable(rv$nca_summary_results, rownames = FALSE,
+              colnames = c("Parameter", "N", "Mean", "SD", "SEM",
+                           "Geo Mean", "GSD", "Median", "Min", "Max"),
               options = list(scrollX = TRUE, dom = 't')) %>%
-      formatSignif(columns = c("Mean", "SD", "SEM", "Median", "Min", "Max"), digits = 4)
+      formatSignif(columns = c("Mean", "SD", "SEM", "Geo_Mean", "GSD",
+                                "Median", "Min", "Max"), digits = 4)
   })
 
   # ---- Compartmental Tables ----

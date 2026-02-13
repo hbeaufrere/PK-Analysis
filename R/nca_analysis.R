@@ -240,7 +240,7 @@ run_nca <- function(df, dose, route) {
 #' Compute summary statistics for NCA results
 #'
 #' @param nca_df Data frame from run_nca
-#' @return Data frame with Mean, SD, SEM, Median, Min, Max per parameter
+#' @return Data frame with Mean, SD, SEM, Geo Mean, GSD, Median, Min, Max per parameter
 nca_summary <- function(nca_df) {
   param_cols <- setdiff(names(nca_df), c("ID", "Lambda_z_npoints"))
 
@@ -250,12 +250,27 @@ nca_summary <- function(nca_df) {
     vals <- vals[!is.na(vals)]
     n <- length(vals)
     if (n > 0) {
+      # Geometric mean & GSD (only for strictly positive values)
+      pos_vals <- vals[vals > 0]
+      if (length(pos_vals) >= 2) {
+        geo_mean <- exp(mean(log(pos_vals)))
+        geo_sd <- exp(sd(log(pos_vals)))
+      } else if (length(pos_vals) == 1) {
+        geo_mean <- pos_vals
+        geo_sd <- NA
+      } else {
+        geo_mean <- NA
+        geo_sd <- NA
+      }
+
       summary_list[[pc]] <- data.frame(
         Parameter = pc,
         N = n,
         Mean = mean(vals),
-        SD = sd(vals),
+        SD = if (n > 1) sd(vals) else NA,
         SEM = if (n > 1) sd(vals) / sqrt(n) else NA,
+        Geo_Mean = geo_mean,
+        GSD = geo_sd,
         Median = median(vals),
         Min = min(vals),
         Max = max(vals),
