@@ -97,6 +97,11 @@ ui <- fluidPage(
                 accept = c(".csv", ".xls", ".xlsx"),
                 placeholder = "CSV or Excel file"),
       helpText("Format: first column = Time, each subsequent column = concentrations for one animal"),
+      actionButton("load_example", "Load Example Dataset",
+                    class = "btn-default btn-block btn-sm",
+                    icon = icon("flask")),
+      helpText(style = "font-size: 11px; color: #777;",
+        "Acetaminophen PO in Orange-winged Amazon parrots (n=8)"),
 
       hr(),
       h4("Study Information", class = "section-title"),
@@ -387,6 +392,42 @@ server <- function(input, output, session) {
         type = "message", duration = 5
       )
     }
+  })
+
+  # ---- Load Example Dataset ----
+  observeEvent(input$load_example, {
+    example_path <- file.path("data", "example_acetaminophen_amazons.csv")
+    if (!file.exists(example_path)) {
+      showNotification("Example dataset file not found.", type = "error")
+      return()
+    }
+
+    result <- load_pk_data(example_path, "example_acetaminophen_amazons.csv")
+
+    if (!is.null(result$error)) {
+      showNotification(result$error, type = "error")
+      return()
+    }
+
+    rv$pk_data <- result$data
+    rv$data_summary <- pk_data_summary(result$data)
+    rv$error_msg <- NULL
+    rv$analysis_complete <- FALSE
+
+    # Pre-fill study information
+    updateTextInput(session, "drug_name", value = "Acetaminophen")
+    updateSelectInput(session, "species", selected = "Orange-winged Amazon parrot")
+    updateSelectInput(session, "route", selected = "PO")
+    updateNumericInput(session, "dose", value = 100)
+    updateSelectInput(session, "dose_unit", selected = "mg/kg")
+    updateSelectInput(session, "conc_unit", selected = "ng/mL")
+    updateSelectInput(session, "time_unit", selected = "h")
+
+    showNotification(
+      paste("Example dataset loaded:", rv$data_summary$n_subjects, "birds,",
+            rv$data_summary$n_observations, "observations"),
+      type = "message", duration = 5
+    )
   })
 
   # ---- Subject Selection Checkboxes ----
