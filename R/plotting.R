@@ -2,6 +2,10 @@
 
 library(ggplot2)
 
+# Color-blind friendly palette (Okabe-Ito)
+cb_palette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442",
+                "#0072B2", "#D55E00", "#CC79A7", "#999999")
+
 #' Create mean +/- SEM concentration-time plot
 #'
 #' @param df Data frame with ID, Time, Conc columns
@@ -10,7 +14,7 @@ library(ggplot2)
 #' @param drug_name Character, drug name for plot title
 #' @param time_unit Character, time unit for axis label
 #' @param conc_unit Character, concentration unit for axis label
-#' @param color_mode Character, "color" or "bw"
+#' @param color_mode Character, "color", "cb" (colorblind), or "bw"
 #' @param show_ci Logical, show SEM ribbon/error bars
 #' @return ggplot object
 plot_mean_conc_time <- function(df, log_y = FALSE, species = "", drug_name = "",
@@ -46,9 +50,16 @@ plot_mean_conc_time <- function(df, log_y = FALSE, species = "", drug_name = "",
   plot_title <- paste("Concentration-Time Profile",
                       if (length(title_parts) > 0) paste("-", paste(title_parts, collapse = " ")) else "")
 
-  is_bw <- (color_mode == "bw")
-  line_col <- if (is_bw) "black" else "#2166AC"
-  fill_col <- if (is_bw) "grey60" else "#2166AC"
+  line_col <- switch(color_mode,
+    "bw" = "black",
+    "cb" = "#0072B2",
+    "#2166AC"  # default color
+  )
+  fill_col <- switch(color_mode,
+    "bw" = "grey60",
+    "cb" = "#0072B2",
+    "#2166AC"  # default color
+  )
 
   p <- ggplot(summary_df, aes(x = Time, y = Mean))
 
@@ -99,7 +110,7 @@ plot_mean_conc_time <- function(df, log_y = FALSE, species = "", drug_name = "",
 #' @param log_y Logical, use log-transformed y-axis
 #' @param time_unit Character, time unit
 #' @param conc_unit Character, concentration unit
-#' @param color_mode Character, "color" or "bw"
+#' @param color_mode Character, "color", "cb" (colorblind), or "bw"
 #' @return ggplot object
 plot_individual_conc_time <- function(df, log_y = FALSE,
                                        time_unit = "h", conc_unit = "ng/mL",
@@ -107,6 +118,7 @@ plot_individual_conc_time <- function(df, log_y = FALSE,
                                        point_size = 1.5, line_width = 0.7,
                                        show_grid = TRUE) {
   is_bw <- (color_mode == "bw")
+  is_cb <- (color_mode == "cb")
   n_subj <- length(unique(df$ID))
 
   if (is_bw) {
@@ -119,6 +131,12 @@ plot_individual_conc_time <- function(df, log_y = FALSE,
       p <- p + scale_linetype_manual(values = rep(c("solid", "dashed", "dotted",
                                                       "dotdash", "longdash", "twodash"), length.out = n_subj))
     }
+  } else if (is_cb) {
+    p <- ggplot(df, aes(x = Time, y = Conc, group = ID, color = ID)) +
+      geom_line(linewidth = line_width, alpha = 0.7) +
+      geom_point(size = point_size, alpha = 0.8) +
+      scale_color_manual(values = rep(cb_palette, length.out = n_subj)) +
+      labs(color = "Subject")
   } else {
     p <- ggplot(df, aes(x = Time, y = Conc, group = ID, color = ID)) +
       geom_line(linewidth = line_width, alpha = 0.7) +
@@ -156,6 +174,193 @@ plot_individual_conc_time <- function(df, log_y = FALSE,
   if (n_subj > 20) {
     p <- p + theme(legend.position = "none") +
       labs(caption = paste(n_subj, "subjects (legend hidden)"))
+  }
+
+  return(p)
+}
+
+#' Create mean +/- SEM plot with multiple compounds superimposed
+#'
+#' @param df Data frame with ID, Time, Conc, Drug columns
+#' @param log_y Logical
+#' @param species Character
+#' @param time_unit Character
+#' @param conc_unit Character
+#' @param color_mode Character, "color", "cb", or "bw"
+#' @param show_ci Logical
+#' @return ggplot object
+plot_mean_conc_time_by_drug <- function(df, log_y = FALSE, species = "",
+                                          time_unit = "h", conc_unit = "ng/mL",
+                                          color_mode = "color", show_ci = TRUE,
+                                          point_size = 2.5, line_width = 1,
+                                          errorbar_width = 0.5, show_grid = TRUE) {
+  drugs <- unique(df$Drug)
+  n_drugs <- length(drugs)
+
+  # Compute mean and SEM per Drug and Time
+  summary_list <- list()
+  for (drug in drugs) {
+    drug_df <- df[df$Drug == drug, ]
+    agg <- aggregate(Conc ~ Time, data = drug_df, FUN = function(x) {
+      c(mean = mean(x, na.rm = TRUE),
+        sem = sd(x, na.rm = TRUE) / sqrt(sum(!is.na(x))),
+        n = sum(!is.na(x)))
+    })
+    s_df <- data.frame(
+      Time = agg$Time,
+      Mean = agg$Conc[, "mean"],
+      SEM = agg$Conc[, "sem"],
+      N = agg$Conc[, "n"],
+      Drug = as.character(drug),
+      stringsAsFactors = FALSE
+    )
+    s_df$Lower <- s_df$Mean - s_df$SEM
+    s_df$Upper <- s_df$Mean + s_df$SEM
+    summary_list[[as.character(drug)]] <- s_df
+  }
+  summary_df <- do.call(rbind, summary_list)
+  rownames(summary_df) <- NULL
+  summary_df$Drug <- factor(summary_df$Drug, levels = unique(df$Drug))
+
+  if (log_y) {
+    min_pos <- min(summary_df$Mean[summary_df$Mean > 0], na.rm = TRUE) * 0.01
+    summary_df$Lower <- pmax(summary_df$Lower, min_pos)
+    summary_df$Mean[summary_df$Mean <= 0] <- NA
+  }
+
+  title_parts <- c()
+  if (nzchar(species)) title_parts <- c(title_parts, paste0("(", species, ")"))
+  plot_title <- paste("Concentration-Time Profile",
+                      if (length(title_parts) > 0) paste("-", paste(title_parts, collapse = " ")) else "")
+
+  is_bw <- (color_mode == "bw")
+  is_cb <- (color_mode == "cb")
+
+  if (is_bw) {
+    p <- ggplot(summary_df, aes(x = Time, y = Mean, group = Drug, linetype = Drug, shape = Drug))
+    if (show_ci) {
+      p <- p + geom_ribbon(aes(ymin = Lower, ymax = Upper, group = Drug),
+                           alpha = 0.1, fill = "grey50")
+    }
+    p <- p +
+      geom_errorbar(aes(ymin = Lower, ymax = Upper),
+                    width = max(diff(range(summary_df$Time))) * 0.015,
+                    linewidth = errorbar_width) +
+      geom_line(linewidth = line_width) +
+      geom_point(size = point_size) +
+      scale_linetype_manual(values = rep(c("solid", "dashed", "dotted",
+                                           "dotdash", "longdash", "twodash"), length.out = n_drugs)) +
+      labs(linetype = "Compound", shape = "Compound")
+  } else {
+    palette <- if (is_cb) cb_palette else scales::hue_pal()(n_drugs)
+    p <- ggplot(summary_df, aes(x = Time, y = Mean, group = Drug, color = Drug, fill = Drug))
+    if (show_ci) {
+      p <- p + geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.15)
+    }
+    p <- p +
+      geom_errorbar(aes(ymin = Lower, ymax = Upper),
+                    width = max(diff(range(summary_df$Time))) * 0.015,
+                    linewidth = errorbar_width) +
+      geom_line(linewidth = line_width) +
+      geom_point(size = point_size) +
+      scale_color_manual(values = palette[1:n_drugs]) +
+      scale_fill_manual(values = palette[1:n_drugs]) +
+      labs(color = "Compound", fill = "Compound")
+  }
+
+  p <- p +
+    labs(
+      title = plot_title,
+      x = paste0("Time (", time_unit, ")"),
+      y = paste0("Concentration (", conc_unit, ")"),
+      caption = paste("Mean \u00B1 SEM")
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      panel.grid.minor = element_line(color = "grey90"),
+      plot.caption = element_text(hjust = 0, size = 10, color = "grey50"),
+      legend.position = "right"
+    )
+
+  if (!show_grid) {
+    p <- p + theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+  }
+
+  if (log_y) {
+    p <- p + scale_y_log10(
+      labels = scales::label_number(drop0trailing = TRUE)
+    ) +
+      labs(y = paste0("Concentration (", conc_unit, ") - Log Scale"))
+  }
+
+  return(p)
+}
+
+#' Create individual plot with multiple compounds superimposed (colored by compound)
+#'
+#' @param df Data frame with ID, Time, Conc, Drug columns
+#' @param log_y Logical
+#' @param time_unit Character
+#' @param conc_unit Character
+#' @param color_mode Character
+#' @return ggplot object
+plot_individual_conc_time_by_drug <- function(df, log_y = FALSE,
+                                                time_unit = "h", conc_unit = "ng/mL",
+                                                color_mode = "color",
+                                                point_size = 1.5, line_width = 0.7,
+                                                show_grid = TRUE) {
+  # Create a unique group per subject-drug combination
+  df$SubjDrug <- interaction(df$ID, df$Drug, sep = " | ")
+  drugs <- unique(df$Drug)
+  n_drugs <- length(drugs)
+
+  is_bw <- (color_mode == "bw")
+  is_cb <- (color_mode == "cb")
+
+  if (is_bw) {
+    p <- ggplot(df, aes(x = Time, y = Conc, group = SubjDrug, linetype = Drug)) +
+      geom_line(linewidth = line_width, alpha = 0.6) +
+      geom_point(aes(shape = Drug), size = point_size, alpha = 0.7) +
+      scale_linetype_manual(values = rep(c("solid", "dashed", "dotted",
+                                           "dotdash", "longdash", "twodash"), length.out = n_drugs)) +
+      labs(linetype = "Compound", shape = "Compound")
+  } else {
+    palette <- if (is_cb) cb_palette else scales::hue_pal()(n_drugs)
+    p <- ggplot(df, aes(x = Time, y = Conc, group = SubjDrug, color = Drug)) +
+      geom_line(linewidth = line_width, alpha = 0.5) +
+      geom_point(size = point_size, alpha = 0.6) +
+      scale_color_manual(values = palette[1:n_drugs]) +
+      labs(color = "Compound")
+  }
+
+  p <- p +
+    labs(
+      title = "Individual Concentration-Time Profiles (All Compounds)",
+      x = paste0("Time (", time_unit, ")"),
+      y = paste0("Concentration (", conc_unit, ")")
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.position = "right"
+    )
+
+  if (!show_grid) {
+    p <- p + theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+  }
+
+  if (log_y) {
+    p <- p + scale_y_log10(
+      labels = scales::label_number(drop0trailing = TRUE)
+    ) +
+      labs(y = paste0("Concentration (", conc_unit, ") - Log Scale"))
   }
 
   return(p)

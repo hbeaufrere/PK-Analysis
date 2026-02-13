@@ -78,6 +78,7 @@ ui <- fluidPage(
     }
     .btn-manuscript:hover { background: linear-gradient(135deg, #4a2475 0%, #6a348d 100%); color: white; }
     .api-key-input { max-width: 500px; }
+    .compound-section { border-top: 2px solid #2d6a9f; padding-top: 15px; margin-top: 25px; }
   "))),
 
   # Header
@@ -96,12 +97,18 @@ ui <- fluidPage(
       fileInput("data_file", "Upload PK Data",
                 accept = c(".csv", ".xls", ".xlsx"),
                 placeholder = "CSV or Excel file"),
-      helpText("Format: first column = Time, each subsequent column = concentrations for one animal"),
+      helpText("Format: first column = Time, each subsequent column = concentrations for one animal.",
+               "Optionally include a 'Drug' column for multiple compounds."),
       actionButton("load_example", "Load Example Dataset",
                     class = "btn-default btn-block btn-sm",
                     icon = icon("flask")),
       helpText(style = "font-size: 11px; color: #777;",
         "Acetaminophen PO in Orange-winged Amazon parrots (n=8)"),
+      actionButton("load_example_multi", "Load Example Dataset (Multiple Compounds)",
+                    class = "btn-default btn-block btn-sm",
+                    icon = icon("vials")),
+      helpText(style = "font-size: 11px; color: #777;",
+        "APAP, APAP+NAC, APAP+Silymarin PO in Amazon parrots (n=8 per group)"),
 
       hr(),
       h4("Study Information", class = "section-title"),
@@ -223,11 +230,17 @@ ui <- fluidPage(
                 column(3,
                   checkboxInput("log_y_obs", "Log-transformed Y-axis", value = FALSE),
                   checkboxInput("show_ci", "Show confidence shading", value = TRUE),
-                  checkboxInput("show_grid", "Show background grid", value = TRUE)
+                  checkboxInput("show_grid", "Show background grid", value = TRUE),
+                  conditionalPanel(
+                    condition = "output.has_multi_compound",
+                    checkboxInput("superimpose_compounds", "Superimpose compounds", value = FALSE)
+                  )
                 ),
                 column(3,
                   radioButtons("color_mode", "Color Scheme",
-                               choices = c("Color" = "color", "Black & White" = "bw"),
+                               choices = c("Color" = "color",
+                                           "Color (colorblind-friendly)" = "cb",
+                                           "BW" = "bw"),
                                inline = FALSE, selected = "color"),
                   sliderInput("point_size", "Point Size", min = 1, max = 8, value = 2.5, step = 0.5),
                   sliderInput("line_width", "Line Width", min = 0.5, max = 4, value = 1, step = 0.25),
@@ -267,52 +280,7 @@ ui <- fluidPage(
                 column(4, checkboxInput("show_diagnostics", "Show Diagnostic Plots", value = TRUE))
               )
             ),
-            plotOutput("model_fit_plot", height = "500px"),
-            conditionalPanel(
-              condition = "input.show_diagnostics",
-              hr(),
-              h4("Goodness-of-Fit Diagnostics", class = "section-title"),
-              fluidRow(
-                column(6,
-                  plotOutput("diag_obs_pred", height = "350px"),
-                  helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
-                    tags$strong("Observed vs. Predicted:"),
-                    "Points should scatter closely around the line of identity (dashed diagonal). ",
-                    "Systematic deviations above or below the line indicate model bias. ",
-                    "A good fit shows points evenly distributed along the line with no trends."
-                  )
-                ),
-                column(6,
-                  plotOutput("diag_resid", height = "350px"),
-                  helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
-                    tags$strong("Residuals vs. Predicted:"),
-                    "Residuals should be randomly scattered around zero (horizontal dashed line) with no pattern. ",
-                    "A funnel shape suggests heteroscedasticity (variance changes with concentration). ",
-                    "Systematic curvature indicates model misspecification."
-                  )
-                )
-              ),
-              fluidRow(
-                column(6,
-                  plotOutput("diag_qq", height = "350px"),
-                  helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
-                    tags$strong("Q-Q Plot (Normal Quantiles):"),
-                    "Points should follow the diagonal reference line if residuals are normally distributed. ",
-                    "S-shaped deviations indicate heavy or light tails. ",
-                    "Departures at the extremes are common with small samples but large deviations may suggest outliers or model issues."
-                  )
-                ),
-                column(6,
-                  plotOutput("diag_hist", height = "350px"),
-                  helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
-                    tags$strong("Residual Histogram:"),
-                    "The distribution of residuals should be approximately bell-shaped and centered near zero. ",
-                    "Strong skewness or multimodality may indicate model misspecification or outliers. ",
-                    "With few subjects, some asymmetry is expected."
-                  )
-                )
-              )
-            )
+            uiOutput("model_fit_ui")
           ),
           conditionalPanel(
             condition = "!output.is_compartmental",
@@ -372,7 +340,12 @@ server <- function(input, output, session) {
     comp_summary_stats = NULL,
     analysis_complete = FALSE,
     analysis_type = NULL,
-    error_msg = NULL
+    error_msg = NULL,
+    # Multi-compound analysis results (list keyed by drug name)
+    multi_nca_results = NULL,
+    multi_nca_summary = NULL,
+    multi_comp_results = NULL,
+    multi_comp_summary = NULL
   )
 
   # ---- Data Loading ----
@@ -390,15 +363,16 @@ server <- function(input, output, session) {
       rv$error_msg <- NULL
       rv$analysis_complete <- FALSE
 
-      showNotification(
-        paste("Data loaded:", rv$data_summary$n_subjects, "subjects,",
-              rv$data_summary$n_observations, "observations"),
-        type = "message", duration = 5
-      )
+      desc <- paste("Data loaded:", rv$data_summary$n_subjects, "subjects,",
+                    rv$data_summary$n_observations, "observations")
+      if (isTRUE(rv$data_summary$has_drug)) {
+        desc <- paste0(desc, " (", rv$data_summary$n_drugs, " compounds)")
+      }
+      showNotification(desc, type = "message", duration = 5)
     }
   })
 
-  # ---- Load Example Dataset ----
+  # ---- Load Example Dataset (single compound) ----
   observeEvent(input$load_example, {
     example_path <- file.path("data", "example_acetaminophen_amazons.csv")
     if (!file.exists(example_path)) {
@@ -434,6 +408,43 @@ server <- function(input, output, session) {
     )
   })
 
+  # ---- Load Example Dataset (multiple compounds) ----
+  observeEvent(input$load_example_multi, {
+    example_path <- file.path("data", "example_multicompound_apap.csv")
+    if (!file.exists(example_path)) {
+      showNotification("Multi-compound example dataset file not found.", type = "error")
+      return()
+    }
+
+    result <- load_pk_data(example_path, "example_multicompound_apap.csv")
+
+    if (!is.null(result$error)) {
+      showNotification(result$error, type = "error")
+      return()
+    }
+
+    rv$pk_data <- result$data
+    rv$data_summary <- pk_data_summary(result$data)
+    rv$error_msg <- NULL
+    rv$analysis_complete <- FALSE
+
+    # Pre-fill study information
+    updateTextInput(session, "drug_name", value = "Acetaminophen")
+    updateSelectInput(session, "species", selected = "Orange-winged Amazon parrot")
+    updateSelectInput(session, "route", selected = "PO")
+    updateNumericInput(session, "dose", value = 100)
+    updateSelectInput(session, "dose_unit", selected = "mg/kg")
+    updateSelectInput(session, "conc_unit", selected = "ng/mL")
+    updateSelectInput(session, "time_unit", selected = "h")
+
+    showNotification(
+      paste("Multi-compound example loaded:", rv$data_summary$n_subjects, "subjects,",
+            rv$data_summary$n_drugs, "compounds,",
+            rv$data_summary$n_observations, "observations"),
+      type = "message", duration = 5
+    )
+  })
+
   # ---- Subject Selection Checkboxes ----
   output$subject_checkboxes <- renderUI({
     req(rv$data_summary)
@@ -464,20 +475,31 @@ server <- function(input, output, session) {
   })
   outputOptions(output, "is_compartmental", suspendWhenHidden = FALSE)
 
+  output$has_multi_compound <- reactive({
+    !is.null(rv$data_summary) && isTRUE(rv$data_summary$has_drug)
+  })
+  outputOptions(output, "has_multi_compound", suspendWhenHidden = FALSE)
+
   # ---- Data Status ----
   output$data_status <- renderUI({
     if (!is.null(rv$error_msg)) {
       div(class = "status-box status-error", icon("exclamation-triangle"), rv$error_msg)
     } else if (is.null(rv$pk_data)) {
       div(class = "status-box status-info", icon("info-circle"),
-          "Upload a CSV or Excel file. First column = Time, each subsequent column = concentrations for one animal.")
+          "Upload a CSV or Excel file. First column = Time, each subsequent column = concentrations for one animal.",
+          "Optionally include a 'Drug' column for multiple compounds.")
     } else {
       n_included <- length(input$included_subjects)
       n_total <- rv$data_summary$n_subjects
       excl_text <- if (n_included < n_total) paste0(" (", n_total - n_included, " excluded)") else ""
+      drug_text <- ""
+      if (isTRUE(rv$data_summary$has_drug)) {
+        drug_text <- paste0(", ", rv$data_summary$n_drugs, " compounds: ",
+                           paste(rv$data_summary$drugs, collapse = ", "))
+      }
       div(class = "status-box status-success", icon("check-circle"),
           paste0("Data loaded: ", n_included, " of ", n_total, " subjects included", excl_text,
-                 ", ", nrow(filtered_data()), " observations"))
+                 ", ", nrow(filtered_data()), " observations", drug_text))
     }
   })
 
@@ -487,27 +509,45 @@ server <- function(input, output, session) {
     fdata <- filtered_data()
     s <- rv$data_summary
     n_included <- length(input$included_subjects)
-    tags$div(
+    items <- tagList(
       tags$p(tags$strong("Total Subjects: "), s$n_subjects),
       tags$p(tags$strong("Included: "), n_included),
       tags$p(tags$strong("Observations: "), nrow(fdata)),
-      tags$p(tags$strong("Time range: "), round(s$time_range[1], 2), " - ", round(s$time_range[2], 2)),
-      if (nrow(fdata) > 0) {
+      tags$p(tags$strong("Time range: "), round(s$time_range[1], 2), " - ", round(s$time_range[2], 2))
+    )
+    if (nrow(fdata) > 0) {
+      items <- tagList(items,
         tags$p(tags$strong("Conc range: "),
                round(min(fdata$Conc, na.rm = TRUE), 3), " - ",
                round(max(fdata$Conc, na.rm = TRUE), 3))
-      },
+      )
+    }
+    if (isTRUE(s$has_drug)) {
+      items <- tagList(items,
+        tags$p(tags$strong("Compounds: "), paste(s$drugs, collapse = ", "))
+      )
+    }
+    items <- tagList(items,
       tags$p(tags$strong("Subject IDs: "), paste(s$subjects, collapse = ", "))
     )
+    items
   })
 
   # ---- Data Preview Table ----
   output$data_preview <- renderDT({
     req(rv$pk_data)
+    has_drug <- "Drug" %in% names(rv$pk_data)
+    if (has_drug) {
+      display_cols <- c("ID", "Time", "Conc", "Drug")
+      col_names <- c("Subject ID", "Time", "Concentration", "Compound")
+    } else {
+      display_cols <- c("ID", "Time", "Conc")
+      col_names <- c("Subject ID", "Time", "Concentration")
+    }
     datatable(
-      rv$pk_data[, c("ID", "Time", "Conc")],
+      rv$pk_data[, display_cols],
       options = list(pageLength = 15, scrollX = TRUE),
-      colnames = c("Subject ID", "Time", "Concentration"),
+      colnames = col_names,
       rownames = FALSE
     ) %>%
       formatRound(columns = c("Time", "Conc"), digits = 4)
@@ -517,21 +557,71 @@ server <- function(input, output, session) {
   output$obs_plots_ui <- renderUI({
     req(filtered_data())
     plot_type <- input$plot_type_obs
+    is_multi <- isTRUE(rv$data_summary$has_drug)
+    superimpose <- isTRUE(input$superimpose_compounds) && is_multi
 
-    if (plot_type == "mean") {
-      plotOutput("mean_plot", height = "500px")
-    } else if (plot_type == "individual") {
-      plotOutput("indiv_plot", height = "500px")
+    if (superimpose) {
+      # Superimposed multi-compound plots
+      if (plot_type == "mean") {
+        plotOutput("mean_plot_multi", height = "550px")
+      } else if (plot_type == "individual") {
+        plotOutput("indiv_plot_multi", height = "550px")
+      } else {
+        tagList(
+          plotOutput("mean_plot_multi", height = "500px"),
+          br(),
+          plotOutput("indiv_plot_multi", height = "500px")
+        )
+      }
+    } else if (is_multi && !superimpose) {
+      # Per-compound plots stacked
+      drugs <- levels(filtered_data()$Drug)
+      if (is.null(drugs)) drugs <- unique(as.character(filtered_data()$Drug))
+      plot_list <- tagList()
+      for (i in seq_along(drugs)) {
+        drug <- drugs[i]
+        mean_id <- paste0("mean_plot_drug_", i)
+        indiv_id <- paste0("indiv_plot_drug_", i)
+        if (plot_type == "mean") {
+          plot_list <- tagList(plot_list,
+            h4(drug, class = "section-title"),
+            plotOutput(mean_id, height = "450px"),
+            br()
+          )
+        } else if (plot_type == "individual") {
+          plot_list <- tagList(plot_list,
+            h4(drug, class = "section-title"),
+            plotOutput(indiv_id, height = "450px"),
+            br()
+          )
+        } else {
+          plot_list <- tagList(plot_list,
+            h4(drug, class = "section-title"),
+            plotOutput(mean_id, height = "400px"),
+            br(),
+            plotOutput(indiv_id, height = "400px"),
+            br()
+          )
+        }
+      }
+      plot_list
     } else {
-      tagList(
-        plotOutput("mean_plot", height = "450px"),
-        br(),
-        plotOutput("indiv_plot", height = "450px")
-      )
+      # Single compound
+      if (plot_type == "mean") {
+        plotOutput("mean_plot", height = "500px")
+      } else if (plot_type == "individual") {
+        plotOutput("indiv_plot", height = "500px")
+      } else {
+        tagList(
+          plotOutput("mean_plot", height = "450px"),
+          br(),
+          plotOutput("indiv_plot", height = "450px")
+        )
+      }
     }
   })
 
-  # Helper to build mean plot (reused for display and download)
+  # Helper to build mean plot (reused for display and download) - single compound
   build_mean_plot <- reactive({
     req(filtered_data(), nrow(filtered_data()) > 0)
     plot_mean_conc_time(
@@ -550,7 +640,7 @@ server <- function(input, output, session) {
     )
   })
 
-  # Helper to build individual plot (reused for display and download)
+  # Helper to build individual plot (reused for display and download) - single compound
   build_indiv_plot <- reactive({
     req(filtered_data(), nrow(filtered_data()) > 0)
     plot_individual_conc_time(
@@ -565,8 +655,97 @@ server <- function(input, output, session) {
     )
   })
 
+  # Multi-compound superimposed plots
+  build_mean_plot_multi <- reactive({
+    req(filtered_data(), nrow(filtered_data()) > 0)
+    req("Drug" %in% names(filtered_data()))
+    plot_mean_conc_time_by_drug(
+      filtered_data(),
+      log_y = input$log_y_obs,
+      species = input$species,
+      time_unit = input$time_unit,
+      conc_unit = input$conc_unit,
+      color_mode = input$color_mode,
+      show_ci = input$show_ci,
+      point_size = input$point_size,
+      line_width = input$line_width,
+      errorbar_width = input$errorbar_width,
+      show_grid = input$show_grid
+    )
+  })
+
+  build_indiv_plot_multi <- reactive({
+    req(filtered_data(), nrow(filtered_data()) > 0)
+    req("Drug" %in% names(filtered_data()))
+    plot_individual_conc_time_by_drug(
+      filtered_data(),
+      log_y = input$log_y_obs,
+      time_unit = input$time_unit,
+      conc_unit = input$conc_unit,
+      color_mode = input$color_mode,
+      point_size = input$point_size,
+      line_width = input$line_width,
+      show_grid = input$show_grid
+    )
+  })
+
   output$mean_plot <- renderPlot({ build_mean_plot() })
   output$indiv_plot <- renderPlot({ build_indiv_plot() })
+  output$mean_plot_multi <- renderPlot({ build_mean_plot_multi() })
+  output$indiv_plot_multi <- renderPlot({ build_indiv_plot_multi() })
+
+  # Per-compound individual plots (dynamic rendering)
+  observe({
+    fdata <- filtered_data()
+    req(fdata, nrow(fdata) > 0)
+    if (!("Drug" %in% names(fdata))) return()
+
+    drugs <- levels(fdata$Drug)
+    if (is.null(drugs)) drugs <- unique(as.character(fdata$Drug))
+
+    for (i in seq_along(drugs)) {
+      local({
+        drug_idx <- i
+        drug_name_local <- drugs[drug_idx]
+
+        output[[paste0("mean_plot_drug_", drug_idx)]] <- renderPlot({
+          req(filtered_data())
+          drug_data <- filtered_data()[filtered_data()$Drug == drug_name_local, ]
+          req(nrow(drug_data) > 0)
+          plot_mean_conc_time(
+            drug_data,
+            log_y = input$log_y_obs,
+            species = input$species,
+            drug_name = drug_name_local,
+            time_unit = input$time_unit,
+            conc_unit = input$conc_unit,
+            color_mode = input$color_mode,
+            show_ci = input$show_ci,
+            point_size = input$point_size,
+            line_width = input$line_width,
+            errorbar_width = input$errorbar_width,
+            show_grid = input$show_grid
+          )
+        })
+
+        output[[paste0("indiv_plot_drug_", drug_idx)]] <- renderPlot({
+          req(filtered_data())
+          drug_data <- filtered_data()[filtered_data()$Drug == drug_name_local, ]
+          req(nrow(drug_data) > 0)
+          plot_individual_conc_time(
+            drug_data,
+            log_y = input$log_y_obs,
+            time_unit = input$time_unit,
+            conc_unit = input$conc_unit,
+            color_mode = input$color_mode,
+            point_size = input$point_size,
+            line_width = input$line_width,
+            show_grid = input$show_grid
+          )
+        })
+      })
+    }
+  })
 
   # ---- Plot Downloads ----
   output$download_mean_plot <- downloadHandler(
@@ -574,7 +753,13 @@ server <- function(input, output, session) {
       paste0("pk_mean_conc_time_", Sys.Date(), ".png")
     },
     content = function(file) {
-      p <- build_mean_plot()
+      is_multi <- isTRUE(rv$data_summary$has_drug)
+      superimpose <- isTRUE(input$superimpose_compounds) && is_multi
+      if (superimpose) {
+        p <- build_mean_plot_multi()
+      } else {
+        p <- build_mean_plot()
+      }
       ggsave(file, plot = p, width = 10, height = 6, dpi = 300)
     }
   )
@@ -584,7 +769,13 @@ server <- function(input, output, session) {
       paste0("pk_individual_conc_time_", Sys.Date(), ".png")
     },
     content = function(file) {
-      p <- build_indiv_plot()
+      is_multi <- isTRUE(rv$data_summary$has_drug)
+      superimpose <- isTRUE(input$superimpose_compounds) && is_multi
+      if (superimpose) {
+        p <- build_indiv_plot_multi()
+      } else {
+        p <- build_indiv_plot()
+      }
       ggsave(file, plot = p, width = 10, height = 6, dpi = 300)
     }
   )
@@ -600,13 +791,6 @@ server <- function(input, output, session) {
       return()
     }
 
-    n_subjects <- length(unique(fdata$ID))
-    if (n_subjects < 2 && input$model_type != "NCA") {
-      showNotification("Compartmental models require at least 2 subjects. Include more subjects or use NCA.",
-                       type = "error")
-      return()
-    }
-
     # Determine if route is IV (for NCA and model selection)
     route_val <- input$route
     is_iv <- route_val %in% c("IV", "IV_INF")
@@ -616,44 +800,150 @@ server <- function(input, output, session) {
     rv$analysis_complete <- FALSE
     rv$error_msg <- NULL
 
+    # Check if multi-compound
+    is_multi <- "Drug" %in% names(fdata) && length(unique(fdata$Drug)) > 1
+
     # Show progress
     withProgress(message = "Running PK analysis...", value = 0, {
-      if (input$model_type == "NCA") {
-        # ---- Non-Compartmental Analysis ----
-        incProgress(0.3, detail = "Computing NCA parameters...")
+      if (is_multi) {
+        # ---- Multi-compound analysis ----
+        drugs <- unique(as.character(fdata$Drug))
 
-        rv$nca_results <- run_nca(fdata, input$dose, route_for_model)
-        rv$nca_summary_results <- nca_summary(rv$nca_results)
-        rv$comp_results <- NULL
+        if (input$model_type == "NCA") {
+          multi_nca <- list()
+          multi_nca_sum <- list()
 
-        incProgress(0.7, detail = "Done!")
-        rv$analysis_complete <- TRUE
+          for (di in seq_along(drugs)) {
+            drug <- drugs[di]
+            incProgress(0.8 / length(drugs), detail = paste("NCA for", drug, "..."))
+            drug_data <- fdata[fdata$Drug == drug, ]
 
-        showNotification("NCA completed successfully", type = "message", duration = 5)
+            nca_res <- run_nca(drug_data, input$dose, route_for_model)
+            nca_sum <- nca_summary(nca_res)
+            multi_nca[[drug]] <- nca_res
+            multi_nca_sum[[drug]] <- nca_sum
+          }
 
-      } else {
-        # ---- Compartmental Modeling ----
-        incProgress(0.2, detail = "Estimating initial parameters...")
-
-        result <- fit_compartmental_model(
-          fdata, input$dose, input$model_type, route_for_model
-        )
-
-        if (!is.null(result$error)) {
-          rv$error_msg <- result$error
-          rv$comp_results <- NULL
-          showNotification(result$error, type = "error", duration = 10)
-        } else {
-          rv$comp_results <- result
+          rv$multi_nca_results <- multi_nca
+          rv$multi_nca_summary <- multi_nca_sum
           rv$nca_results <- NULL
           rv$nca_summary_results <- NULL
-          rv$analysis_complete <- TRUE
+          rv$comp_results <- NULL
+          rv$multi_comp_results <- NULL
+          rv$multi_comp_summary <- NULL
 
-          incProgress(0.8, detail = "Done!")
+          incProgress(0.2, detail = "Done!")
+          rv$analysis_complete <- TRUE
           showNotification(
-            paste(input$model_type, "model fitted successfully"),
+            paste("NCA completed for", length(drugs), "compounds"),
             type = "message", duration = 5
           )
+
+        } else {
+          # Compartmental per compound
+          multi_comp <- list()
+          multi_comp_sum <- list()
+          any_success <- FALSE
+
+          for (di in seq_along(drugs)) {
+            drug <- drugs[di]
+            incProgress(0.8 / length(drugs), detail = paste("Fitting", input$model_type, "for", drug, "..."))
+            drug_data <- fdata[fdata$Drug == drug, ]
+
+            n_subjects <- length(unique(drug_data$ID))
+            if (n_subjects < 2) {
+              showNotification(
+                paste("Skipping", drug, "- need at least 2 subjects for compartmental modeling"),
+                type = "warning", duration = 5
+              )
+              next
+            }
+
+            result <- fit_compartmental_model(
+              drug_data, input$dose, input$model_type, route_for_model
+            )
+
+            if (!is.null(result$error)) {
+              showNotification(
+                paste(drug, ":", result$error),
+                type = "warning", duration = 10
+              )
+            } else {
+              multi_comp[[drug]] <- result
+              any_success <- TRUE
+            }
+          }
+
+          if (any_success) {
+            rv$multi_comp_results <- multi_comp
+            rv$nca_results <- NULL
+            rv$nca_summary_results <- NULL
+            rv$comp_results <- NULL
+            rv$multi_nca_results <- NULL
+            rv$multi_nca_summary <- NULL
+            rv$analysis_complete <- TRUE
+
+            incProgress(0.2, detail = "Done!")
+            showNotification(
+              paste(input$model_type, "fitted for", length(multi_comp), "of", length(drugs), "compounds"),
+              type = "message", duration = 5
+            )
+          } else {
+            rv$error_msg <- "Compartmental modeling failed for all compounds."
+            showNotification(rv$error_msg, type = "error", duration = 10)
+          }
+        }
+
+      } else {
+        # ---- Single compound analysis ----
+        # Clear multi-compound results
+        rv$multi_nca_results <- NULL
+        rv$multi_nca_summary <- NULL
+        rv$multi_comp_results <- NULL
+        rv$multi_comp_summary <- NULL
+
+        n_subjects <- length(unique(fdata$ID))
+        if (n_subjects < 2 && input$model_type != "NCA") {
+          showNotification("Compartmental models require at least 2 subjects. Include more subjects or use NCA.",
+                           type = "error")
+          return()
+        }
+
+        if (input$model_type == "NCA") {
+          incProgress(0.3, detail = "Computing NCA parameters...")
+
+          rv$nca_results <- run_nca(fdata, input$dose, route_for_model)
+          rv$nca_summary_results <- nca_summary(rv$nca_results)
+          rv$comp_results <- NULL
+
+          incProgress(0.7, detail = "Done!")
+          rv$analysis_complete <- TRUE
+
+          showNotification("NCA completed successfully", type = "message", duration = 5)
+
+        } else {
+          incProgress(0.2, detail = "Estimating initial parameters...")
+
+          result <- fit_compartmental_model(
+            fdata, input$dose, input$model_type, route_for_model
+          )
+
+          if (!is.null(result$error)) {
+            rv$error_msg <- result$error
+            rv$comp_results <- NULL
+            showNotification(result$error, type = "error", duration = 10)
+          } else {
+            rv$comp_results <- result
+            rv$nca_results <- NULL
+            rv$nca_summary_results <- NULL
+            rv$analysis_complete <- TRUE
+
+            incProgress(0.8, detail = "Done!")
+            showNotification(
+              paste(input$model_type, "model fitted successfully"),
+              type = "message", duration = 5
+            )
+          }
         }
       }
     })
@@ -678,6 +968,11 @@ server <- function(input, output, session) {
         "2comp" = "Two-Compartment Model (NLME)",
         "3comp" = "Three-Compartment Model (NLME)"
       )
+      is_multi <- !is.null(rv$multi_nca_results) || !is.null(rv$multi_comp_results)
+      if (is_multi) {
+        n_comp <- max(length(rv$multi_nca_results), length(rv$multi_comp_results))
+        model_desc <- paste0(model_desc, " (", n_comp, " compounds)")
+      }
       div(class = "status-box status-success", icon("check-circle"),
           paste("Analysis complete:", model_desc))
     }
@@ -687,8 +982,67 @@ server <- function(input, output, session) {
   output$results_ui <- renderUI({
     req(rv$analysis_complete)
 
-    if (rv$analysis_type == "NCA") {
-      # NCA Results
+    is_multi_nca <- !is.null(rv$multi_nca_results)
+    is_multi_comp <- !is.null(rv$multi_comp_results)
+
+    if (is_multi_nca) {
+      # Multi-compound NCA results - stacked
+      drugs <- names(rv$multi_nca_results)
+      result_panels <- tagList()
+      for (i in seq_along(drugs)) {
+        drug <- drugs[i]
+        result_panels <- tagList(result_panels,
+          div(class = "compound-section",
+            h3(drug),
+            h4("Individual NCA Parameters", class = "section-title"),
+            DTOutput(paste0("nca_individual_table_", i)),
+            br(),
+            h4("Summary Statistics", class = "section-title"),
+            DTOutput(paste0("nca_summary_table_", i))
+          ),
+          br()
+        )
+      }
+      tagList(
+        result_panels,
+        h4("Parameter Guide", class = "section-title"),
+        uiOutput("nca_param_guide")
+      )
+
+    } else if (is_multi_comp) {
+      # Multi-compound compartmental results - stacked
+      drugs <- names(rv$multi_comp_results)
+      result_panels <- tagList()
+      for (i in seq_along(drugs)) {
+        drug <- drugs[i]
+        result_panels <- tagList(result_panels,
+          div(class = "compound-section",
+            h3(drug),
+            h4("Population (Fixed Effect) Parameters", class = "section-title"),
+            DTOutput(paste0("comp_pop_table_", i)),
+            br(),
+            h4("Individual Parameter Estimates", class = "section-title"),
+            DTOutput(paste0("comp_indiv_table_", i)),
+            br(),
+            h4("Summary Statistics of Individual Parameters", class = "section-title"),
+            DTOutput(paste0("comp_summary_table_", i)),
+            br(),
+            wellPanel(
+              h5("Model Diagnostics"),
+              uiOutput(paste0("model_info_", i))
+            )
+          ),
+          br()
+        )
+      }
+      tagList(
+        result_panels,
+        h4("Parameter Guide", class = "section-title"),
+        uiOutput("comp_param_guide")
+      )
+
+    } else if (rv$analysis_type == "NCA") {
+      # Single compound NCA
       is_iv <- input$route %in% c("IV", "IV_INF")
       tagList(
         h4("Individual NCA Parameters", class = "section-title"),
@@ -701,7 +1055,7 @@ server <- function(input, output, session) {
         uiOutput("nca_param_guide")
       )
     } else {
-      # Compartmental Results
+      # Single compound Compartmental
       tagList(
         h4("Population (Fixed Effect) Parameters", class = "section-title"),
         DTOutput("comp_pop_table"),
@@ -842,11 +1196,10 @@ server <- function(input, output, session) {
     )
   })
 
-  # ---- NCA Tables ----
+  # ---- NCA Tables (single compound) ----
   output$nca_individual_table <- renderDT({
     req(rv$nca_results)
     df <- rv$nca_results
-    # Format numeric columns
     num_cols <- setdiff(names(df), "ID")
     datatable(df, rownames = FALSE,
               options = list(scrollX = TRUE, pageLength = 20)) %>%
@@ -863,11 +1216,45 @@ server <- function(input, output, session) {
                                 "Median", "Min", "Max"), digits = 4)
   })
 
-  # ---- Compartmental Tables ----
+  # ---- Multi-compound NCA Tables (dynamic) ----
+  observe({
+    req(rv$multi_nca_results)
+    drugs <- names(rv$multi_nca_results)
+
+    for (i in seq_along(drugs)) {
+      local({
+        drug_idx <- i
+        drug <- drugs[drug_idx]
+
+        output[[paste0("nca_individual_table_", drug_idx)]] <- renderDT({
+          req(rv$multi_nca_results)
+          df <- rv$multi_nca_results[[drug]]
+          req(df)
+          num_cols <- setdiff(names(df), "ID")
+          datatable(df, rownames = FALSE,
+                    options = list(scrollX = TRUE, pageLength = 20)) %>%
+            formatSignif(columns = num_cols, digits = 4)
+        })
+
+        output[[paste0("nca_summary_table_", drug_idx)]] <- renderDT({
+          req(rv$multi_nca_summary)
+          df <- rv$multi_nca_summary[[drug]]
+          req(df)
+          datatable(df, rownames = FALSE,
+                    colnames = c("Parameter", "N", "Mean", "SD", "SEM",
+                                 "Geo Mean", "GSD", "Median", "Min", "Max"),
+                    options = list(scrollX = TRUE, dom = 't')) %>%
+            formatSignif(columns = c("Mean", "SD", "SEM", "Geo_Mean", "GSD",
+                                      "Median", "Min", "Max"), digits = 4)
+        })
+      })
+    }
+  })
+
+  # ---- Compartmental Tables (single compound) ----
   output$comp_pop_table <- renderDT({
     req(rv$comp_results)
     df <- rv$comp_results$summary
-    # Show SE and 95% CI if available
     if (all(c("SE", "CI_lower", "CI_upper") %in% names(df))) {
       display_df <- df[, c("Parameter", "Estimate", "SE", "CI_lower", "CI_upper")]
       datatable(display_df, rownames = FALSE,
@@ -948,7 +1335,196 @@ server <- function(input, output, session) {
     )
   })
 
+  # ---- Multi-compound Compartmental Tables (dynamic) ----
+  observe({
+    req(rv$multi_comp_results)
+    drugs <- names(rv$multi_comp_results)
+
+    for (i in seq_along(drugs)) {
+      local({
+        drug_idx <- i
+        drug <- drugs[drug_idx]
+
+        output[[paste0("comp_pop_table_", drug_idx)]] <- renderDT({
+          req(rv$multi_comp_results)
+          result <- rv$multi_comp_results[[drug]]
+          req(result)
+          df <- result$summary
+          if (all(c("SE", "CI_lower", "CI_upper") %in% names(df))) {
+            display_df <- df[, c("Parameter", "Estimate", "SE", "CI_lower", "CI_upper")]
+            datatable(display_df, rownames = FALSE,
+                      colnames = c("Parameter", "Estimate", "SE", "95% CI Lower", "95% CI Upper"),
+                      options = list(dom = 't', scrollX = TRUE)) %>%
+              formatSignif(columns = c("Estimate", "SE", "CI_lower", "CI_upper"), digits = 4)
+          } else {
+            display_df <- df[, c("Parameter", "Estimate")]
+            display_df$Estimate <- signif(display_df$Estimate, 4)
+            datatable(display_df, rownames = FALSE,
+                      options = list(dom = 't', scrollX = TRUE))
+          }
+        })
+
+        output[[paste0("comp_indiv_table_", drug_idx)]] <- renderDT({
+          req(rv$multi_comp_results)
+          result <- rv$multi_comp_results[[drug]]
+          req(result)
+          df <- result$params
+          num_cols <- setdiff(names(df), "ID")
+          datatable(df, rownames = FALSE,
+                    options = list(scrollX = TRUE, pageLength = 20)) %>%
+            formatSignif(columns = num_cols, digits = 4)
+        })
+
+        output[[paste0("comp_summary_table_", drug_idx)]] <- renderDT({
+          req(rv$multi_comp_results)
+          result <- rv$multi_comp_results[[drug]]
+          req(result)
+          df <- result$params
+          req(df, nrow(df) > 1)
+          num_cols <- setdiff(names(df), "ID")
+
+          summary_rows <- list()
+          for (col in num_cols) {
+            vals <- df[[col]]
+            if (is.numeric(vals) && length(vals) > 1) {
+              n <- sum(!is.na(vals))
+              m <- mean(vals, na.rm = TRUE)
+              s <- sd(vals, na.rm = TRUE)
+              sem <- s / sqrt(n)
+              ci_lower <- m - qt(0.975, df = n - 1) * sem
+              ci_upper <- m + qt(0.975, df = n - 1) * sem
+              geo_vals <- vals[vals > 0 & !is.na(vals)]
+              geo_mean <- if (length(geo_vals) > 0) exp(mean(log(geo_vals))) else NA
+              gsd <- if (length(geo_vals) > 1) exp(sd(log(geo_vals))) else NA
+              med <- median(vals, na.rm = TRUE)
+              mn <- min(vals, na.rm = TRUE)
+              mx <- max(vals, na.rm = TRUE)
+              summary_rows[[length(summary_rows) + 1]] <- data.frame(
+                Parameter = col, N = n, Mean = m, SD = s, SEM = sem,
+                CI_lower = ci_lower, CI_upper = ci_upper,
+                Geo_Mean = geo_mean, GSD = gsd,
+                Median = med, Min = mn, Max = mx,
+                stringsAsFactors = FALSE
+              )
+            }
+          }
+          summary_df <- do.call(rbind, summary_rows)
+
+          datatable(summary_df, rownames = FALSE,
+                    colnames = c("Parameter", "N", "Mean", "SD", "SEM",
+                                 "95% CI Lower", "95% CI Upper",
+                                 "Geo Mean", "GSD", "Median", "Min", "Max"),
+                    options = list(scrollX = TRUE, dom = 't')) %>%
+            formatSignif(columns = c("Mean", "SD", "SEM", "CI_lower", "CI_upper",
+                                      "Geo_Mean", "GSD", "Median", "Min", "Max"), digits = 4)
+        })
+
+        output[[paste0("model_info_", drug_idx)]] <- renderUI({
+          req(rv$multi_comp_results)
+          result <- rv$multi_comp_results[[drug]]
+          req(result)
+          pop <- result$summary
+          aic_val <- pop$AIC[1]
+          bic_val <- pop$BIC[1]
+          ll_val <- pop$logLik[1]
+
+          tags$div(
+            tags$p(tags$strong("AIC: "), round(aic_val, 2)),
+            tags$p(tags$strong("BIC: "), round(bic_val, 2)),
+            tags$p(tags$strong("Log-Likelihood: "), round(ll_val, 2))
+          )
+        })
+      })
+    }
+  })
+
   # ---- Model Fit Plots ----
+  output$model_fit_ui <- renderUI({
+    req(rv$analysis_complete)
+    req(rv$analysis_type != "NCA")
+
+    is_multi_comp <- !is.null(rv$multi_comp_results)
+
+    if (is_multi_comp) {
+      drugs <- names(rv$multi_comp_results)
+      fit_panels <- tagList()
+      for (i in seq_along(drugs)) {
+        drug <- drugs[i]
+        fit_panels <- tagList(fit_panels,
+          div(class = "compound-section",
+            h3(drug),
+            plotOutput(paste0("model_fit_plot_", i), height = "500px"),
+            conditionalPanel(
+              condition = "input.show_diagnostics",
+              hr(),
+              h4("Goodness-of-Fit Diagnostics", class = "section-title"),
+              fluidRow(
+                column(6, plotOutput(paste0("diag_obs_pred_", i), height = "350px")),
+                column(6, plotOutput(paste0("diag_resid_", i), height = "350px"))
+              ),
+              fluidRow(
+                column(6, plotOutput(paste0("diag_qq_", i), height = "350px")),
+                column(6, plotOutput(paste0("diag_hist_", i), height = "350px"))
+              )
+            )
+          ),
+          br()
+        )
+      }
+      fit_panels
+    } else {
+      tagList(
+        plotOutput("model_fit_plot", height = "500px"),
+        conditionalPanel(
+          condition = "input.show_diagnostics",
+          hr(),
+          h4("Goodness-of-Fit Diagnostics", class = "section-title"),
+          fluidRow(
+            column(6,
+              plotOutput("diag_obs_pred", height = "350px"),
+              helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+                tags$strong("Observed vs. Predicted:"),
+                "Points should scatter closely around the line of identity (dashed diagonal). ",
+                "Systematic deviations above or below the line indicate model bias. ",
+                "A good fit shows points evenly distributed along the line with no trends."
+              )
+            ),
+            column(6,
+              plotOutput("diag_resid", height = "350px"),
+              helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+                tags$strong("Residuals vs. Predicted:"),
+                "Residuals should be randomly scattered around zero (horizontal dashed line) with no pattern. ",
+                "A funnel shape suggests heteroscedasticity (variance changes with concentration). ",
+                "Systematic curvature indicates model misspecification."
+              )
+            )
+          ),
+          fluidRow(
+            column(6,
+              plotOutput("diag_qq", height = "350px"),
+              helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+                tags$strong("Q-Q Plot (Normal Quantiles):"),
+                "Points should follow the diagonal reference line if residuals are normally distributed. ",
+                "S-shaped deviations indicate heavy or light tails. ",
+                "Departures at the extremes are common with small samples but large deviations may suggest outliers or model issues."
+              )
+            ),
+            column(6,
+              plotOutput("diag_hist", height = "350px"),
+              helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+                tags$strong("Residual Histogram:"),
+                "The distribution of residuals should be approximately bell-shaped and centered near zero. ",
+                "Strong skewness or multimodality may indicate model misspecification or outliers. ",
+                "With few subjects, some asymmetry is expected."
+              )
+            )
+          )
+        )
+      )
+    }
+  })
+
+  # Single compound model fit plot
   output$model_fit_plot <- renderPlot({
     req(rv$comp_results, rv$comp_results$predictions)
     model_labels <- c(
@@ -968,7 +1544,7 @@ server <- function(input, output, session) {
     )
   })
 
-  # ---- Diagnostic Plots ----
+  # ---- Diagnostic Plots (single compound) ----
   output$diag_obs_pred <- renderPlot({
     req(rv$comp_results, rv$comp_results$fit)
     plots <- plot_diagnostics(rv$comp_results$fit, filtered_data())
@@ -991,6 +1567,80 @@ server <- function(input, output, session) {
     req(rv$comp_results, rv$comp_results$fit)
     plots <- plot_diagnostics(rv$comp_results$fit, filtered_data())
     plots$resid_hist
+  })
+
+  # ---- Multi-compound Model Fit & Diagnostic Plots (dynamic) ----
+  observe({
+    req(rv$multi_comp_results)
+    drugs <- names(rv$multi_comp_results)
+    fdata <- filtered_data()
+
+    for (i in seq_along(drugs)) {
+      local({
+        drug_idx <- i
+        drug <- drugs[drug_idx]
+
+        output[[paste0("model_fit_plot_", drug_idx)]] <- renderPlot({
+          req(rv$multi_comp_results)
+          result <- rv$multi_comp_results[[drug]]
+          req(result, result$predictions)
+          drug_data <- filtered_data()[filtered_data()$Drug == drug, ]
+          req(nrow(drug_data) > 0)
+
+          model_labels <- c(
+            "1comp" = "One-Compartment",
+            "2comp" = "Two-Compartment",
+            "3comp" = "Three-Compartment"
+          )
+          route_label <- names(route_options)[route_options == input$route]
+
+          plot_model_fit(
+            drug_data,
+            result$predictions,
+            log_y = input$log_y_fit,
+            model_label = paste(drug, "-", model_labels[rv$analysis_type], "-", route_label),
+            time_unit = input$time_unit,
+            conc_unit = input$conc_unit
+          )
+        })
+
+        output[[paste0("diag_obs_pred_", drug_idx)]] <- renderPlot({
+          req(rv$multi_comp_results)
+          result <- rv$multi_comp_results[[drug]]
+          req(result, result$fit)
+          drug_data <- filtered_data()[filtered_data()$Drug == drug, ]
+          plots <- plot_diagnostics(result$fit, drug_data)
+          plots$obs_vs_pred
+        })
+
+        output[[paste0("diag_resid_", drug_idx)]] <- renderPlot({
+          req(rv$multi_comp_results)
+          result <- rv$multi_comp_results[[drug]]
+          req(result, result$fit)
+          drug_data <- filtered_data()[filtered_data()$Drug == drug, ]
+          plots <- plot_diagnostics(result$fit, drug_data)
+          plots$resid_vs_pred
+        })
+
+        output[[paste0("diag_qq_", drug_idx)]] <- renderPlot({
+          req(rv$multi_comp_results)
+          result <- rv$multi_comp_results[[drug]]
+          req(result, result$fit)
+          drug_data <- filtered_data()[filtered_data()$Drug == drug, ]
+          plots <- plot_diagnostics(result$fit, drug_data)
+          plots$qq_plot
+        })
+
+        output[[paste0("diag_hist_", drug_idx)]] <- renderPlot({
+          req(rv$multi_comp_results)
+          result <- rv$multi_comp_results[[drug]]
+          req(result, result$fit)
+          drug_data <- filtered_data()[filtered_data()$Drug == drug, ]
+          plots <- plot_diagnostics(result$fit, drug_data)
+          plots$resid_hist
+        })
+      })
+    }
   })
 
   # ---- Manuscript Generation ----
@@ -1020,6 +1670,20 @@ server <- function(input, output, session) {
       weight_unit = input$weight_unit
     )
 
+    # For multi-compound, use first compound's results for manuscript generation
+    nca_res <- rv$nca_results
+    nca_sum <- rv$nca_summary_results
+    comp_res <- rv$comp_results
+    comp_sum <- rv$comp_summary_stats
+
+    if (!is.null(rv$multi_nca_results)) {
+      nca_res <- rv$multi_nca_results[[1]]
+      nca_sum <- rv$multi_nca_summary[[1]]
+    }
+    if (!is.null(rv$multi_comp_results)) {
+      comp_res <- rv$multi_comp_results[[1]]
+    }
+
     rv_manuscript$content <- NULL
     rv_manuscript$error <- NULL
     rv_manuscript$table <- NULL
@@ -1031,10 +1695,10 @@ server <- function(input, output, session) {
         api_key    = api_key,
         study_info = study_info,
         analysis_type = rv$analysis_type,
-        nca_results   = rv$nca_results,
-        nca_summary   = rv$nca_summary_results,
-        comp_results  = rv$comp_results,
-        comp_summary_stats = rv$comp_summary_stats
+        nca_results   = nca_res,
+        nca_summary   = nca_sum,
+        comp_results  = comp_res,
+        comp_summary_stats = comp_sum
       )
       incProgress(0.7, detail = "Done!")
     })
@@ -1149,7 +1813,29 @@ server <- function(input, output, session) {
       paste0("pk_parameters_", rv$analysis_type, "_", Sys.Date(), ".csv")
     },
     content = function(file) {
-      if (rv$analysis_type == "NCA") {
+      if (!is.null(rv$multi_nca_results)) {
+        # Multi-compound NCA: combine all with a Drug column
+        all_results <- list()
+        for (drug in names(rv$multi_nca_results)) {
+          df <- rv$multi_nca_results[[drug]]
+          df$Drug <- drug
+          all_results[[drug]] <- df
+        }
+        combined <- do.call(rbind, all_results)
+        rownames(combined) <- NULL
+        write.csv(combined, file, row.names = FALSE)
+      } else if (!is.null(rv$multi_comp_results)) {
+        # Multi-compound compartmental: combine population summaries
+        all_results <- list()
+        for (drug in names(rv$multi_comp_results)) {
+          df <- rv$multi_comp_results[[drug]]$summary
+          df$Drug <- drug
+          all_results[[drug]] <- df
+        }
+        combined <- do.call(rbind, all_results)
+        rownames(combined) <- NULL
+        write.csv(combined, file, row.names = FALSE)
+      } else if (rv$analysis_type == "NCA") {
         write.csv(rv$nca_results, file, row.names = FALSE)
       } else {
         pop <- rv$comp_results$summary
