@@ -12,6 +12,7 @@ source("R/data_validation.R")
 source("R/nca_analysis.R")
 source("R/pk_models.R")
 source("R/plotting.R")
+source("R/manuscript_writer.R")
 
 # ============================================================
 # Species options
@@ -64,6 +65,21 @@ ui <- fluidPage(
     .status-error { background-color: #fce8e6; border-color: #ea4335; color: #5f1412; }
     .status-warning { background-color: #fef7e0; border-color: #fbbc04; color: #5f4b08; }
     .subject-selector .checkbox { margin-top: 2px; margin-bottom: 2px; }
+    .manuscript-output {
+      background-color: #fff; border: 1px solid #dce3ec; border-radius: 6px;
+      padding: 25px 30px; margin-top: 15px; font-family: 'Georgia', 'Times New Roman', serif;
+      font-size: 14px; line-height: 1.8; color: #222;
+    }
+    .manuscript-output h4 { color: #1a3a5c; font-weight: 700; margin-top: 20px;
+                            margin-bottom: 10px; font-family: Arial, sans-serif; }
+    .manuscript-section { margin-bottom: 20px; }
+    .btn-manuscript {
+      background: linear-gradient(135deg, #5b2d8e 0%, #7b3fa0 100%);
+      color: white; border: none; padding: 12px 24px; font-size: 15px;
+      font-weight: 600; border-radius: 6px; cursor: pointer;
+    }
+    .btn-manuscript:hover { background: linear-gradient(135deg, #4a2475 0%, #6a348d 100%); color: white; }
+    .api-key-input { max-width: 500px; }
   "))),
 
   # Header
@@ -255,6 +271,37 @@ ui <- fluidPage(
             div(class = "status-box status-info",
                 "Model fit plots are available for compartmental models (1-, 2-, 3-compartment).
                  Select a compartmental model and run the analysis to view fits.")
+          )
+        ),
+
+        # Tab 5: For Manuscript
+        tabPanel("For Manuscript",
+          icon = icon("file-alt"),
+          br(),
+          conditionalPanel(
+            condition = "output.analysis_done",
+            wellPanel(
+              h4("AI-Powered Manuscript Section Writing", class = "section-title"),
+              p("Generate publication-ready Materials & Methods, Results, and Interpretation sections ",
+                "based on your analysis. Powered by Claude (Anthropic API)."),
+              div(class = "api-key-input",
+                passwordInput("claude_api_key", "Anthropic API Key",
+                              placeholder = "sk-ant-..."),
+                helpText("Your API key is used only for this request and is not stored. ",
+                         "Get a key at ", tags$a("console.anthropic.com",
+                         href = "https://console.anthropic.com/", target = "_blank"), ".")
+              ),
+              actionButton("generate_manuscript", "AI-Powered Manuscript Section Writing",
+                            class = "btn-manuscript",
+                            icon = icon("magic"))
+            ),
+            uiOutput("manuscript_output")
+          ),
+          conditionalPanel(
+            condition = "!output.analysis_done",
+            div(class = "status-box status-info",
+                icon("info-circle"),
+                "Run an analysis first (NCA or compartmental) to enable manuscript generation.")
           )
         )
       )
@@ -799,6 +846,93 @@ server <- function(input, output, session) {
     plots <- plot_diagnostics(rv$comp_results$fit, filtered_data())
     plots$resid_hist
   })
+
+  # ---- Manuscript Generation ----
+  rv_manuscript <- reactiveValues(content = NULL, error = NULL, generating = FALSE)
+
+  observeEvent(input$generate_manuscript, {
+    req(rv$analysis_complete)
+
+    api_key <- input$claude_api_key
+    if (is.null(api_key) || nchar(trimws(api_key)) == 0) {
+      showNotification("Please enter your Anthropic API key.", type = "error")
+      return()
+    }
+
+    # Gather study info
+    n_subj <- length(input$included_subjects)
+    study_info <- list(
+      drug_name  = if (nchar(input$drug_name) > 0) input$drug_name else "Unknown drug",
+      species    = input$species,
+      route      = input$route,
+      dose       = input$dose,
+      dose_unit  = input$dose_unit,
+      time_unit  = input$time_unit,
+      conc_unit  = input$conc_unit,
+      n_subjects = n_subj
+    )
+
+    rv_manuscript$content <- NULL
+    rv_manuscript$error <- NULL
+    rv_manuscript$generating <- TRUE
+
+    # Run generation
+    withProgress(message = "Generating manuscript sections...", value = 0.3, {
+      result <- generate_manuscript(
+        api_key    = api_key,
+        study_info = study_info,
+        analysis_type = rv$analysis_type,
+        nca_results   = rv$nca_results,
+        nca_summary   = rv$nca_summary_results,
+        comp_results  = rv$comp_results
+      )
+      incProgress(0.7, detail = "Done!")
+    })
+
+    rv_manuscript$generating <- FALSE
+
+    if (!is.null(result$error)) {
+      rv_manuscript$error <- result$error
+      showNotification(result$error, type = "error", duration = 10)
+    } else {
+      rv_manuscript$content <- result$content
+      showNotification("Manuscript sections generated!", type = "message", duration = 5)
+    }
+  })
+
+  output$manuscript_output <- renderUI({
+    if (isTRUE(rv_manuscript$generating)) {
+      div(class = "status-box status-info", icon("spinner", class = "fa-spin"),
+          "Generating manuscript sections... This may take 15-30 seconds.")
+    } else if (!is.null(rv_manuscript$error)) {
+      div(class = "status-box status-error", icon("exclamation-triangle"),
+          rv_manuscript$error)
+    } else if (!is.null(rv_manuscript$content)) {
+      # Parse the content into sections
+      content <- rv_manuscript$content
+
+      tagList(
+        div(class = "manuscript-output",
+          h4(icon("file-alt"), " Generated Manuscript Sections"),
+          hr(),
+          div(class = "manuscript-section",
+            HTML(gsub("\n", "<br/>", htmltools::htmlEscape(content)))
+          )
+        ),
+        br(),
+        downloadButton("download_manuscript", "Download as Text File", class = "btn-block")
+      )
+    }
+  })
+
+  output$download_manuscript <- downloadHandler(
+    filename = function() {
+      paste0("pk_manuscript_", rv$analysis_type, "_", Sys.Date(), ".txt")
+    },
+    content = function(file) {
+      writeLines(rv_manuscript$content, file)
+    }
+  )
 
   # ---- Downloads ----
   output$download_params <- downloadHandler(
