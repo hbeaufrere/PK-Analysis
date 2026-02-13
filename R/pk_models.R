@@ -174,6 +174,7 @@ three_comp_ev <- function(time, dose, lCL, lV1, lQ2, lV2, lQ3, lV3, lka) {
 # ============================================================
 
 #' Estimate initial parameters from data for a given model
+#' Uses method of residuals (curve stripping) for multi-compartment IV models
 #'
 #' @param df Data frame with ID, Time, Conc columns
 #' @param dose Numeric dose
@@ -181,7 +182,6 @@ three_comp_ev <- function(time, dose, lCL, lV1, lQ2, lV2, lQ3, lV3, lka) {
 #' @param route Character: "IV" or "EV"
 #' @return Named list of starting parameter values (on log scale)
 estimate_initial_params <- function(df, dose, model_type, route) {
-  # Aggregate data for initial estimates
   mean_data <- aggregate(Conc ~ Time, data = df, FUN = mean)
   mean_data <- mean_data[order(mean_data$Time), ]
 
@@ -190,22 +190,37 @@ estimate_initial_params <- function(df, dose, model_type, route) {
 
   cmax <- max(conc)
   tmax_idx <- which.max(conc)
+  is_iv <- toupper(route) == "IV"
 
-  # Rough V estimate
-  if (toupper(route) == "IV" && conc[1] > 0) {
+  # --- Curve stripping for IV 2-comp and 3-comp ---
+  if (is_iv && model_type %in% c("2comp", "3comp")) {
+    params <- tryCatch(curve_strip_iv(time, conc, dose, model_type), error = function(e) NULL)
+    if (!is.null(params)) {
+      if (model_type == "2comp" && !is_iv) {
+        ka_est <- max(exp(params$lCL) / exp(params$lV1) * 3, 0.5)
+        params$lka <- log(ka_est)
+      }
+      return(params)
+    }
+  }
+
+  # --- Fallback: simple estimation ---
+  if (is_iv && conc[1] > 0) {
     V_est <- dose / conc[1]
   } else {
     V_est <- dose / cmax
   }
   V_est <- max(V_est, 0.01)
 
-  # Rough terminal slope
-  post_peak <- conc[tmax_idx:length(conc)]
-  post_time <- time[tmax_idx:length(time)]
-  pos_idx <- post_peak > 0
+  # Terminal slope from last portion of data
+  n_pts <- length(conc)
+  n_term <- max(3, floor(n_pts / 2))
+  term_conc <- conc[(n_pts - n_term + 1):n_pts]
+  term_time <- time[(n_pts - n_term + 1):n_pts]
+  pos_idx <- term_conc > 0
   if (sum(pos_idx) >= 2) {
-    log_conc <- log(post_peak[pos_idx])
-    t_sub <- post_time[pos_idx]
+    log_conc <- log(term_conc[pos_idx])
+    t_sub <- term_time[pos_idx]
     fit <- lm(log_conc ~ t_sub)
     k_est <- max(-coef(fit)[2], 0.01)
   } else {
@@ -216,8 +231,7 @@ estimate_initial_params <- function(df, dose, model_type, route) {
 
   if (model_type == "1comp") {
     params <- list(lV = log(V_est), lk = log(k_est))
-    if (toupper(route) != "IV") {
-      # Estimate ka from ascending phase
+    if (!is_iv) {
       ka_est <- max(k_est * 3, 0.5)
       params$lka <- log(ka_est)
     }
@@ -228,7 +242,7 @@ estimate_initial_params <- function(df, dose, model_type, route) {
       lQ  = log(CL_est * 0.5),
       lV2 = log(V_est * 0.6)
     )
-    if (toupper(route) != "IV") {
+    if (!is_iv) {
       ka_est <- max(k_est * 3, 0.5)
       params$lka <- log(ka_est)
     }
@@ -241,7 +255,7 @@ estimate_initial_params <- function(df, dose, model_type, route) {
       lQ3 = log(CL_est * 0.1),
       lV3 = log(V_est * 0.3)
     )
-    if (toupper(route) != "IV") {
+    if (!is_iv) {
       ka_est <- max(k_est * 3, 0.5)
       params$lka <- log(ka_est)
     }
@@ -250,12 +264,108 @@ estimate_initial_params <- function(df, dose, model_type, route) {
   return(params)
 }
 
+#' Curve stripping (method of residuals) for IV multi-compartment models
+#' Peels exponential terms from the terminal phase back to get alpha, beta, A, B
+curve_strip_iv <- function(time, conc, dose, model_type) {
+  pos <- conc > 0
+  time <- time[pos]
+  conc <- conc[pos]
+  n <- length(time)
+
+  # Terminal phase: fit log-linear to last ~half of data
+  n_term <- max(3, floor(n * 0.5))
+  idx_term <- (n - n_term + 1):n
+  fit_term <- lm(log(conc[idx_term]) ~ time[idx_term])
+  beta <- max(-coef(fit_term)[2], 1e-6)
+  B_intercept <- exp(coef(fit_term)[1])
+
+  # Residuals: subtract terminal component from all data
+  resid_conc <- conc - B_intercept * exp(-beta * time)
+
+  if (model_type == "2comp") {
+    # Fit the residual (distribution phase)
+    pos_resid <- resid_conc > 0
+    if (sum(pos_resid) >= 2) {
+      fit_dist <- lm(log(resid_conc[pos_resid]) ~ time[pos_resid])
+      alpha <- max(-coef(fit_dist)[2], beta + 0.01)
+      A_intercept <- exp(coef(fit_dist)[1])
+    } else {
+      alpha <- beta * 5
+      A_intercept <- conc[1] - B_intercept
+    }
+    A_intercept <- max(A_intercept, 0.01)
+
+    # Back-calculate CL, V1, Q, V2 from A, B, alpha, beta
+    C0 <- A_intercept + B_intercept
+    V1 <- dose / C0
+    k21 <- (A_intercept * beta + B_intercept * alpha) / C0
+    k10 <- alpha * beta / k21
+    k12 <- alpha + beta - k21 - k10
+    k12 <- max(k12, 0.001)
+    k21 <- max(k21, 0.001)
+    CL <- k10 * V1
+    Q  <- k12 * V1
+    V2 <- Q / k21
+
+    return(list(
+      lCL = log(max(CL, 1e-6)),
+      lV1 = log(max(V1, 1e-6)),
+      lQ  = log(max(Q, 1e-6)),
+      lV2 = log(max(V2, 1e-6))
+    ))
+  } else {
+    # 3-comp: peel a second residual
+    resid2 <- resid_conc
+    pos_r2 <- resid2 > 0
+    if (sum(pos_r2) >= 3) {
+      n_mid <- max(2, floor(sum(pos_r2) * 0.5))
+      idx_mid <- which(pos_r2)
+      idx_mid <- idx_mid[(length(idx_mid) - n_mid + 1):length(idx_mid)]
+      fit_mid <- lm(log(resid2[idx_mid]) ~ time[idx_mid])
+      alpha2 <- max(-coef(fit_mid)[2], beta + 0.1)
+      B2_int <- exp(coef(fit_mid)[1])
+    } else {
+      alpha2 <- beta * 3
+      B2_int <- conc[1] * 0.3
+    }
+
+    resid3 <- resid2 - B2_int * exp(-alpha2 * time)
+    pos_r3 <- resid3 > 0
+    if (sum(pos_r3) >= 2) {
+      fit_fast <- lm(log(resid3[pos_r3]) ~ time[pos_r3])
+      alpha1 <- max(-coef(fit_fast)[2], alpha2 + 0.1)
+      A1_int <- exp(coef(fit_fast)[1])
+    } else {
+      alpha1 <- alpha2 * 5
+      A1_int <- conc[1] * 0.4
+    }
+
+    C0 <- A1_int + B2_int + B_intercept
+    V1 <- dose / C0
+    CL <- V1 * alpha1 * alpha2 * beta / (alpha2 * beta + alpha1 * beta + alpha1 * alpha2 -
+           alpha1 * alpha1 - beta * beta - alpha2 * alpha2 + V1)
+    CL <- max(abs(CL), 1e-6)
+
+    return(list(
+      lCL = log(CL),
+      lV1 = log(max(V1, 1e-6)),
+      lQ2 = log(max(CL * 0.5, 1e-6)),
+      lV2 = log(max(V1 * 0.8, 1e-6)),
+      lQ3 = log(max(CL * 0.15, 1e-6)),
+      lV3 = log(max(V1 * 0.5, 1e-6))
+    ))
+  }
+}
+
 
 # ============================================================
 # NLME Fitting
 # ============================================================
 
-#' Fit a compartmental model using nlme
+#' Fit a compartmental model using nlme with robust multi-level fallback
+#'
+#' Strategy: tries progressively simpler random-effects structures
+#' and more relaxed convergence controls until one succeeds.
 #'
 #' @param df Data frame with ID, Time, Conc columns
 #' @param dose Numeric dose
@@ -266,60 +376,46 @@ fit_compartmental_model <- function(df, dose, model_type, route) {
   route_upper <- toupper(route)
   is_iv <- route_upper == "IV"
 
-  # Prepare data as groupedData
+  # Prepare data
   pk_data <- df[, c("ID", "Time", "Conc")]
   pk_data$Dose <- dose
 
-  # Get initial estimates
+  # Get initial estimates (uses curve stripping for IV multi-compartment)
   init_params <- estimate_initial_params(df, dose, model_type, route)
 
-  # Build the model - try full random effects first, fall back to reduced
+  # Build list of fitting attempts (progressively more relaxed)
   fit <- NULL
   fit_error <- NULL
+  last_error <- ""
 
-  # Attempt 1: Full random effects (lCL + lV1 ~ 1 | ID)
-  fit <- tryCatch({
-    if (model_type == "1comp" && is_iv) {
-      fit_1comp_iv(pk_data, init_params)
-    } else if (model_type == "1comp" && !is_iv) {
-      fit_1comp_ev(pk_data, init_params)
-    } else if (model_type == "2comp" && is_iv) {
-      fit_2comp_iv(pk_data, init_params)
-    } else if (model_type == "2comp" && !is_iv) {
-      fit_2comp_ev(pk_data, init_params)
-    } else if (model_type == "3comp" && is_iv) {
-      fit_3comp_iv(pk_data, init_params)
-    } else if (model_type == "3comp" && !is_iv) {
-      fit_3comp_ev(pk_data, init_params)
-    }
-  }, error = function(e) {
-    fit_error <<- e$message
-    NULL
-  })
+  # Define control levels: progressively more relaxed
+  ctrl_strict <- nlmeControl(maxIter = 200, pnlsTol = 0.01, msMaxIter = 200,
+                              tolerance = 1e-5, returnObject = TRUE)
+  ctrl_medium <- nlmeControl(maxIter = 300, pnlsTol = 0.1, msMaxIter = 300,
+                              tolerance = 1e-4, returnObject = TRUE)
+  ctrl_relaxed <- nlmeControl(maxIter = 500, pnlsTol = 1.0, msMaxIter = 500,
+                               tolerance = 1e-3, returnObject = TRUE)
+  ctrl_very_relaxed <- nlmeControl(maxIter = 500, pnlsTol = 2.0, msMaxIter = 500,
+                                    tolerance = 1e-2, returnObject = TRUE, opt = "nlm")
 
-  # Attempt 2: Reduced random effects (lCL ~ 1 | ID) for 2comp/3comp
-  if (is.null(fit) && model_type %in% c("2comp", "3comp")) {
-    message("Full model failed, trying reduced random effects...")
+  # Build attempt list based on model type
+  attempts <- build_fitting_attempts(model_type, is_iv,
+                                      ctrl_strict, ctrl_medium, ctrl_relaxed, ctrl_very_relaxed)
+
+  for (attempt in attempts) {
     fit <- tryCatch({
-      if (model_type == "2comp" && is_iv) {
-        fit_2comp_iv_reduced(pk_data, init_params)
-      } else if (model_type == "2comp" && !is_iv) {
-        fit_2comp_ev_reduced(pk_data, init_params)
-      } else if (model_type == "3comp" && is_iv) {
-        fit_3comp_iv_reduced(pk_data, init_params)
-      } else if (model_type == "3comp" && !is_iv) {
-        fit_3comp_ev_reduced(pk_data, init_params)
-      }
+      do_nlme_fit(pk_data, init_params, model_type, is_iv, attempt)
     }, error = function(e) {
-      fit_error <<- e$message
+      last_error <<- e$message
       NULL
     })
+    if (!is.null(fit)) break
   }
 
   if (is.null(fit)) {
     return(list(
       fit = NULL, params = NULL, summary = NULL, predictions = NULL,
-      error = paste("Model fitting failed:", fit_error,
+      error = paste("Model fitting failed after all attempts:", last_error,
                     "\nTry a simpler model or check your data quality.")
     ))
   }
@@ -343,21 +439,128 @@ fit_compartmental_model <- function(df, dose, model_type, route) {
   })
 }
 
-#' Fit one-compartment IV model
-fit_1comp_iv <- function(data, inits) {
-  nlme(
-    Conc ~ (Dose / exp(lV)) * exp(-exp(lk) * Time),
-    data = data,
-    fixed = lV + lk ~ 1,
-    random = lV + lk ~ 1 | ID,
-    start = c(lV = inits$lV, lk = inits$lk),
-    control = nlmeControl(maxIter = 200, pnlsTol = 0.1, msMaxIter = 200,
-                          returnObject = TRUE),
-    na.action = na.omit
-  )
+#' Build list of fitting attempts with progressively simpler structures
+build_fitting_attempts <- function(model_type, is_iv, ctrl_s, ctrl_m, ctrl_r, ctrl_vr) {
+  if (model_type == "1comp") {
+    return(list(
+      list(re = "full_diag", ctrl = ctrl_s),
+      list(re = "full_sym",  ctrl = ctrl_m),
+      list(re = "re_v_only", ctrl = ctrl_r),
+      list(re = "re_k_only", ctrl = ctrl_r)
+    ))
+  } else if (model_type == "2comp") {
+    return(list(
+      list(re = "full_diag",   ctrl = ctrl_s),     # pdDiag on CL+V1
+      list(re = "full_sym",    ctrl = ctrl_m),      # pdSymm on CL+V1
+      list(re = "re_cl_only",  ctrl = ctrl_m),      # CL only
+      list(re = "re_v1_only",  ctrl = ctrl_m),      # V1 only
+      list(re = "re_cl_only",  ctrl = ctrl_r),      # CL only, relaxed
+      list(re = "re_v1_only",  ctrl = ctrl_r),      # V1 only, relaxed
+      list(re = "re_cl_only",  ctrl = ctrl_vr)      # CL only, very relaxed
+    ))
+  } else {
+    # 3-comp
+    return(list(
+      list(re = "full_diag",   ctrl = ctrl_s),
+      list(re = "full_sym",    ctrl = ctrl_m),
+      list(re = "re_cl_only",  ctrl = ctrl_m),
+      list(re = "re_v1_only",  ctrl = ctrl_m),
+      list(re = "re_cl_only",  ctrl = ctrl_r),
+      list(re = "re_v1_only",  ctrl = ctrl_r),
+      list(re = "re_cl_only",  ctrl = ctrl_vr)
+    ))
+  }
 }
 
-#' One-compartment extravascular prediction function
+#' Execute a single nlme fitting attempt
+do_nlme_fit <- function(data, inits, model_type, is_iv, attempt) {
+  re_type <- attempt$re
+  ctrl <- attempt$ctrl
+
+  if (model_type == "1comp") {
+    if (is_iv) {
+      model_formula <- Conc ~ (Dose / exp(lV)) * exp(-exp(lk) * Time)
+      fixed_form <- lV + lk ~ 1
+      starts <- c(lV = inits$lV, lk = inits$lk)
+      random_form <- switch(re_type,
+        "full_diag" = lV + lk ~ 1 | ID,
+        "full_sym"  = lV + lk ~ 1 | ID,
+        "re_v_only" = lV ~ 1 | ID,
+        "re_k_only" = lk ~ 1 | ID
+      )
+    } else {
+      model_formula <- Conc ~ .pred_1comp_ev(lV, lk, lka, Time, Dose)
+      fixed_form <- lV + lk + lka ~ 1
+      starts <- c(lV = inits$lV, lk = inits$lk, lka = inits$lka)
+      random_form <- switch(re_type,
+        "full_diag" = lV + lk ~ 1 | ID,
+        "full_sym"  = lV + lk ~ 1 | ID,
+        "re_v_only" = lV ~ 1 | ID,
+        "re_k_only" = lk ~ 1 | ID
+      )
+    }
+    use_diag <- re_type == "full_diag"
+  } else if (model_type == "2comp") {
+    if (is_iv) {
+      model_formula <- Conc ~ .pred_2comp_iv(lCL, lV1, lQ, lV2, Time, Dose)
+      fixed_form <- lCL + lV1 + lQ + lV2 ~ 1
+      starts <- c(lCL = inits$lCL, lV1 = inits$lV1, lQ = inits$lQ, lV2 = inits$lV2)
+    } else {
+      model_formula <- Conc ~ .pred_2comp_ev(lCL, lV1, lQ, lV2, lka, Time, Dose)
+      fixed_form <- lCL + lV1 + lQ + lV2 + lka ~ 1
+      starts <- c(lCL = inits$lCL, lV1 = inits$lV1, lQ = inits$lQ,
+                   lV2 = inits$lV2, lka = inits$lka)
+    }
+    random_form <- switch(re_type,
+      "full_diag"  = lCL + lV1 ~ 1 | ID,
+      "full_sym"   = lCL + lV1 ~ 1 | ID,
+      "re_cl_only" = lCL ~ 1 | ID,
+      "re_v1_only" = lV1 ~ 1 | ID
+    )
+    use_diag <- re_type == "full_diag"
+  } else {
+    # 3-comp
+    if (is_iv) {
+      model_formula <- Conc ~ .pred_3comp_iv(lCL, lV1, lQ2, lV2, lQ3, lV3, Time, Dose)
+      fixed_form <- lCL + lV1 + lQ2 + lV2 + lQ3 + lV3 ~ 1
+      starts <- c(lCL = inits$lCL, lV1 = inits$lV1, lQ2 = inits$lQ2,
+                   lV2 = inits$lV2, lQ3 = inits$lQ3, lV3 = inits$lV3)
+    } else {
+      model_formula <- Conc ~ .pred_3comp_ev(lCL, lV1, lQ2, lV2, lQ3, lV3, lka, Time, Dose)
+      fixed_form <- lCL + lV1 + lQ2 + lV2 + lQ3 + lV3 + lka ~ 1
+      starts <- c(lCL = inits$lCL, lV1 = inits$lV1, lQ2 = inits$lQ2,
+                   lV2 = inits$lV2, lQ3 = inits$lQ3, lV3 = inits$lV3, lka = inits$lka)
+    }
+    random_form <- switch(re_type,
+      "full_diag"  = lCL + lV1 ~ 1 | ID,
+      "full_sym"   = lCL + lV1 ~ 1 | ID,
+      "re_cl_only" = lCL ~ 1 | ID,
+      "re_v1_only" = lV1 ~ 1 | ID
+    )
+    use_diag <- re_type == "full_diag"
+  }
+
+  if (use_diag) {
+    nlme(model_formula,
+         data = data,
+         fixed = fixed_form,
+         random = pdDiag(random_form),
+         start = starts,
+         control = ctrl,
+         na.action = na.omit)
+  } else {
+    nlme(model_formula,
+         data = data,
+         fixed = fixed_form,
+         random = random_form,
+         start = starts,
+         control = ctrl,
+         na.action = na.omit)
+  }
+}
+
+#' Prediction functions for nlme formulas (must be at module level)
+
 .pred_1comp_ev <- function(lV, lk, lka, Time, Dose) {
   v <- exp(lV); k <- exp(lk); ka <- exp(lka)
   dka <- ka - k
@@ -365,22 +568,6 @@ fit_1comp_iv <- function(data, inits) {
   (Dose * ka / (v * dka)) * (exp(-k * Time) - exp(-ka * Time))
 }
 
-#' Fit one-compartment extravascular model
-fit_1comp_ev <- function(data, inits) {
-  nlme(
-    Conc ~ .pred_1comp_ev(lV, lk, lka, Time, Dose),
-    data = data,
-    fixed = lV + lk + lka ~ 1,
-    random = lV + lk ~ 1 | ID,
-    start = c(lV = inits$lV, lk = inits$lk, lka = inits$lka),
-    control = nlmeControl(maxIter = 200, pnlsTol = 0.1, msMaxIter = 200,
-                          returnObject = TRUE),
-    na.action = na.omit
-  )
-}
-
-#' Two-compartment IV prediction function
-#' Defined at module level for reliable nlme formula evaluation
 .pred_2comp_iv <- function(lCL, lV1, lQ, lV2, Time, Dose) {
   cl <- exp(lCL); v1 <- exp(lV1); q <- exp(lQ); v2 <- exp(lV2)
   k10 <- cl / v1; k12 <- q / v1; k21 <- q / v2
@@ -396,35 +583,6 @@ fit_1comp_ev <- function(data, inits) {
   A * exp(-alpha * Time) + B * exp(-beta * Time)
 }
 
-#' Fit two-compartment IV model
-fit_2comp_iv <- function(data, inits) {
-  nlme(
-    Conc ~ .pred_2comp_iv(lCL, lV1, lQ, lV2, Time, Dose),
-    data = data,
-    fixed = lCL + lV1 + lQ + lV2 ~ 1,
-    random = lCL + lV1 ~ 1 | ID,
-    start = c(lCL = inits$lCL, lV1 = inits$lV1, lQ = inits$lQ, lV2 = inits$lV2),
-    control = nlmeControl(maxIter = 200, pnlsTol = 0.1, msMaxIter = 200,
-                          returnObject = TRUE),
-    na.action = na.omit
-  )
-}
-
-#' Fit two-compartment IV model with reduced random effects (fallback)
-fit_2comp_iv_reduced <- function(data, inits) {
-  nlme(
-    Conc ~ .pred_2comp_iv(lCL, lV1, lQ, lV2, Time, Dose),
-    data = data,
-    fixed = lCL + lV1 + lQ + lV2 ~ 1,
-    random = lCL ~ 1 | ID,
-    start = c(lCL = inits$lCL, lV1 = inits$lV1, lQ = inits$lQ, lV2 = inits$lV2),
-    control = nlmeControl(maxIter = 200, pnlsTol = 0.5, msMaxIter = 200,
-                          returnObject = TRUE),
-    na.action = na.omit
-  )
-}
-
-#' Two-compartment extravascular prediction function
 .pred_2comp_ev <- function(lCL, lV1, lQ, lV2, lka, Time, Dose) {
   cl <- exp(lCL); v1 <- exp(lV1); q <- exp(lQ); v2 <- exp(lV2); ka <- exp(lka)
   k10 <- cl / v1; k12 <- q / v1; k21 <- q / v2
@@ -446,37 +604,6 @@ fit_2comp_iv_reduced <- function(data, inits) {
   A_c * exp(-alpha * Time) + B_c * exp(-beta * Time) + C_c * exp(-ka * Time)
 }
 
-#' Fit two-compartment extravascular model
-fit_2comp_ev <- function(data, inits) {
-  nlme(
-    Conc ~ .pred_2comp_ev(lCL, lV1, lQ, lV2, lka, Time, Dose),
-    data = data,
-    fixed = lCL + lV1 + lQ + lV2 + lka ~ 1,
-    random = lCL + lV1 ~ 1 | ID,
-    start = c(lCL = inits$lCL, lV1 = inits$lV1, lQ = inits$lQ,
-              lV2 = inits$lV2, lka = inits$lka),
-    control = nlmeControl(maxIter = 200, pnlsTol = 0.1, msMaxIter = 200,
-                          returnObject = TRUE),
-    na.action = na.omit
-  )
-}
-
-#' Fit two-compartment extravascular model with reduced random effects (fallback)
-fit_2comp_ev_reduced <- function(data, inits) {
-  nlme(
-    Conc ~ .pred_2comp_ev(lCL, lV1, lQ, lV2, lka, Time, Dose),
-    data = data,
-    fixed = lCL + lV1 + lQ + lV2 + lka ~ 1,
-    random = lCL ~ 1 | ID,
-    start = c(lCL = inits$lCL, lV1 = inits$lV1, lQ = inits$lQ,
-              lV2 = inits$lV2, lka = inits$lka),
-    control = nlmeControl(maxIter = 200, pnlsTol = 0.5, msMaxIter = 200,
-                          returnObject = TRUE),
-    na.action = na.omit
-  )
-}
-
-#' Three-compartment IV prediction function
 .pred_3comp_iv <- function(lCL, lV1, lQ2, lV2, lQ3, lV3, Time, Dose) {
   cl <- exp(lCL); v1 <- exp(lV1); q2 <- exp(lQ2); v2 <- exp(lV2)
   q3 <- exp(lQ3); v3 <- exp(lV3)
@@ -507,37 +634,6 @@ fit_2comp_ev_reduced <- function(data, inits) {
   A * exp(-alpha * Time) + B * exp(-beta * Time) + Cc * exp(-gamma * Time)
 }
 
-#' Fit three-compartment IV model
-fit_3comp_iv <- function(data, inits) {
-  nlme(
-    Conc ~ .pred_3comp_iv(lCL, lV1, lQ2, lV2, lQ3, lV3, Time, Dose),
-    data = data,
-    fixed = lCL + lV1 + lQ2 + lV2 + lQ3 + lV3 ~ 1,
-    random = lCL + lV1 ~ 1 | ID,
-    start = c(lCL = inits$lCL, lV1 = inits$lV1, lQ2 = inits$lQ2,
-              lV2 = inits$lV2, lQ3 = inits$lQ3, lV3 = inits$lV3),
-    control = nlmeControl(maxIter = 200, pnlsTol = 0.1, msMaxIter = 200,
-                          returnObject = TRUE),
-    na.action = na.omit
-  )
-}
-
-#' Fit three-compartment IV model with reduced random effects (fallback)
-fit_3comp_iv_reduced <- function(data, inits) {
-  nlme(
-    Conc ~ .pred_3comp_iv(lCL, lV1, lQ2, lV2, lQ3, lV3, Time, Dose),
-    data = data,
-    fixed = lCL + lV1 + lQ2 + lV2 + lQ3 + lV3 ~ 1,
-    random = lCL ~ 1 | ID,
-    start = c(lCL = inits$lCL, lV1 = inits$lV1, lQ2 = inits$lQ2,
-              lV2 = inits$lV2, lQ3 = inits$lQ3, lV3 = inits$lV3),
-    control = nlmeControl(maxIter = 200, pnlsTol = 0.5, msMaxIter = 200,
-                          returnObject = TRUE),
-    na.action = na.omit
-  )
-}
-
-#' Three-compartment extravascular prediction function
 .pred_3comp_ev <- function(lCL, lV1, lQ2, lV2, lQ3, lV3, lka, Time, Dose) {
   cl <- exp(lCL); v1 <- exp(lV1); q2 <- exp(lQ2); v2 <- exp(lV2)
   q3 <- exp(lQ3); v3 <- exp(lV3); ka <- exp(lka)
@@ -564,36 +660,6 @@ fit_3comp_iv_reduced <- function(data, inits) {
   C_c <- coeff * ((k21 - gamma) * (k31 - gamma)) / (safe_div(alpha - gamma) * safe_div(beta - gamma) * safe_div(ka - gamma))
   D_c <- coeff * ((k21 - ka) * (k31 - ka)) / (safe_div(alpha - ka) * safe_div(beta - ka) * safe_div(gamma - ka))
   A_c * exp(-alpha * Time) + B_c * exp(-beta * Time) + C_c * exp(-gamma * Time) + D_c * exp(-ka * Time)
-}
-
-#' Fit three-compartment extravascular model
-fit_3comp_ev <- function(data, inits) {
-  nlme(
-    Conc ~ .pred_3comp_ev(lCL, lV1, lQ2, lV2, lQ3, lV3, lka, Time, Dose),
-    data = data,
-    fixed = lCL + lV1 + lQ2 + lV2 + lQ3 + lV3 + lka ~ 1,
-    random = lCL + lV1 ~ 1 | ID,
-    start = c(lCL = inits$lCL, lV1 = inits$lV1, lQ2 = inits$lQ2,
-              lV2 = inits$lV2, lQ3 = inits$lQ3, lV3 = inits$lV3, lka = inits$lka),
-    control = nlmeControl(maxIter = 200, pnlsTol = 0.1, msMaxIter = 200,
-                          returnObject = TRUE),
-    na.action = na.omit
-  )
-}
-
-#' Fit three-compartment extravascular model with reduced random effects (fallback)
-fit_3comp_ev_reduced <- function(data, inits) {
-  nlme(
-    Conc ~ .pred_3comp_ev(lCL, lV1, lQ2, lV2, lQ3, lV3, lka, Time, Dose),
-    data = data,
-    fixed = lCL + lV1 + lQ2 + lV2 + lQ3 + lV3 + lka ~ 1,
-    random = lCL ~ 1 | ID,
-    start = c(lCL = inits$lCL, lV1 = inits$lV1, lQ2 = inits$lQ2,
-              lV2 = inits$lV2, lQ3 = inits$lQ3, lV3 = inits$lV3, lka = inits$lka),
-    control = nlmeControl(maxIter = 200, pnlsTol = 0.5, msMaxIter = 200,
-                          returnObject = TRUE),
-    na.action = na.omit
-  )
 }
 
 
