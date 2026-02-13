@@ -739,12 +739,15 @@ extract_gnls_params <- function(fit, model_type, route, dose, data) {
   fe <- coef(fit)
   is_iv <- toupper(route) == "IV"
 
+  vcov_mat <- tryCatch(vcov(fit), error = function(e) NULL)
+  df_resid <- tryCatch(nrow(data) - length(fe), error = function(e) NULL)
+
   if (model_type == "1comp") {
-    pop_params <- extract_1comp_params(fe, dose, is_iv)
+    pop_params <- extract_1comp_params(fe, dose, is_iv, vcov_mat, df_resid)
   } else if (model_type == "2comp") {
-    pop_params <- extract_2comp_params(fe, dose, is_iv)
+    pop_params <- extract_2comp_params(fe, dose, is_iv, vcov_mat, df_resid)
   } else {
-    pop_params <- extract_3comp_params(fe, dose, is_iv)
+    pop_params <- extract_3comp_params(fe, dose, is_iv, vcov_mat, df_resid)
   }
 
   pop_params$AIC <- AIC(fit)
@@ -917,9 +920,16 @@ extract_compartmental_params <- function(fit, model_type, route, dose) {
   re <- ranef(fit)
   is_iv <- toupper(route) == "IV"
 
+  # Extract vcov and residual df for SE/CI computation
+  vcov_mat <- tryCatch(vcov(fit), error = function(e) NULL)
+  df_resid <- tryCatch({
+    tt <- summary(fit)$tTable
+    if (!is.null(tt) && "DF" %in% colnames(tt)) tt[1, "DF"] else nrow(fit$data) - length(fe)
+  }, error = function(e) nrow(fit$data) - length(fe))
+
   if (model_type == "1comp") {
-    pop_params <- extract_1comp_params(fe, dose, is_iv)
-    # Individual parameters
+    pop_params <- extract_1comp_params(fe, dose, is_iv, vcov_mat, df_resid)
+    # Individual parameters (no SE/CI for individuals)
     indiv_list <- list()
     for (i in 1:nrow(re)) {
       subj_id <- rownames(re)[i]
@@ -933,7 +943,7 @@ extract_compartmental_params <- function(fit, model_type, route, dose) {
     }
     indiv_df <- do.call(rbind, lapply(indiv_list, as.data.frame, stringsAsFactors = FALSE))
   } else if (model_type == "2comp") {
-    pop_params <- extract_2comp_params(fe, dose, is_iv)
+    pop_params <- extract_2comp_params(fe, dose, is_iv, vcov_mat, df_resid)
     indiv_list <- list()
     for (i in 1:nrow(re)) {
       subj_id <- rownames(re)[i]
@@ -947,7 +957,7 @@ extract_compartmental_params <- function(fit, model_type, route, dose) {
     }
     indiv_df <- do.call(rbind, lapply(indiv_list, as.data.frame, stringsAsFactors = FALSE))
   } else if (model_type == "3comp") {
-    pop_params <- extract_3comp_params(fe, dose, is_iv)
+    pop_params <- extract_3comp_params(fe, dose, is_iv, vcov_mat, df_resid)
     indiv_list <- list()
     for (i in 1:nrow(re)) {
       subj_id <- rownames(re)[i]
@@ -970,7 +980,51 @@ extract_compartmental_params <- function(fit, model_type, route, dose) {
   return(list(population = pop_params, individual = indiv_df))
 }
 
-extract_1comp_params <- function(fe, dose, is_iv) {
+#' Compute SE for a derived parameter using the numerical delta method
+#' @param fe Named vector of fixed effects (log-scale)
+#' @param vcov_mat Variance-covariance matrix of fixed effects
+#' @param fun Function(fe) -> scalar derived parameter value
+#' @return Standard error on the natural scale (NA if computation fails)
+delta_method_se <- function(fe, vcov_mat, fun) {
+  tryCatch({
+    eps <- 1e-5
+    grad <- numeric(length(fe))
+    f0 <- fun(fe)
+    for (j in seq_along(fe)) {
+      fe_plus <- fe
+      fe_plus[j] <- fe_plus[j] + eps
+      grad[j] <- (fun(fe_plus) - f0) / eps
+    }
+    var_est <- as.numeric(t(grad) %*% vcov_mat %*% grad)
+    if (var_est >= 0) sqrt(var_est) else NA_real_
+  }, error = function(e) NA_real_)
+}
+
+#' Add SE and 95% CI columns to a parameter data frame using the delta method
+#' @param params Data frame with Parameter and Estimate columns
+#' @param fe Named vector of fixed effects (log-scale)
+#' @param vcov_mat Variance-covariance matrix of fixed effects
+#' @param param_funs Named list of functions mapping fe -> derived value (names match params$Parameter)
+#' @param df_resid Residual degrees of freedom for t-distribution
+#' @return params with SE, CI_lower, CI_upper columns appended
+add_se_ci_to_params <- function(params, fe, vcov_mat, param_funs, df_resid) {
+  se_vec <- numeric(nrow(params))
+  for (i in seq_len(nrow(params))) {
+    pname <- params$Parameter[i]
+    if (pname %in% names(param_funs)) {
+      se_vec[i] <- delta_method_se(fe, vcov_mat, param_funs[[pname]])
+    } else {
+      se_vec[i] <- NA_real_
+    }
+  }
+  t_crit <- tryCatch(qt(0.975, df = df_resid), error = function(e) 1.96)
+  params$SE <- se_vec
+  params$CI_lower <- params$Estimate - t_crit * se_vec
+  params$CI_upper <- params$Estimate + t_crit * se_vec
+  return(params)
+}
+
+extract_1comp_params <- function(fe, dose, is_iv, vcov_mat = NULL, df_resid = NULL) {
   V <- exp(fe["lV"])
   k <- exp(fe["lk"])
   CL <- V * k
@@ -993,10 +1047,26 @@ extract_1comp_params <- function(fe, dose, is_iv) {
   }
 
   rownames(params) <- NULL
+
+  # Add SE and 95% CI if vcov available
+  if (!is.null(vcov_mat) && !is.null(df_resid)) {
+    v_name <- if (is_iv) "V (L)" else "V/F (L)"
+    cl_name <- if (is_iv) "CL (L/h)" else "CL/F (L/h)"
+    pfuns <- list()
+    pfuns[[v_name]]         <- function(x) exp(x["lV"])
+    pfuns[[cl_name]]        <- function(x) exp(x["lV"]) * exp(x["lk"])
+    pfuns[["k (1/h)"]]      <- function(x) exp(x["lk"])
+    pfuns[["Half-life (h)"]] <- function(x) log(2) / exp(x["lk"])
+    if (!is_iv && "lka" %in% names(fe)) {
+      pfuns[["ka (1/h)"]] <- function(x) exp(x["lka"])
+    }
+    params <- add_se_ci_to_params(params, fe, vcov_mat, pfuns, df_resid)
+  }
+
   return(params)
 }
 
-extract_2comp_params <- function(fe, dose, is_iv) {
+extract_2comp_params <- function(fe, dose, is_iv, vcov_mat = NULL, df_resid = NULL) {
   CL <- exp(fe["lCL"])
   V1 <- exp(fe["lV1"])
   Q  <- exp(fe["lQ"])
@@ -1035,10 +1105,38 @@ extract_2comp_params <- function(fe, dose, is_iv) {
   }
 
   rownames(params) <- NULL
+
+  # Add SE and 95% CI if vcov available
+  if (!is.null(vcov_mat) && !is.null(df_resid)) {
+    # Helper: compute alpha/beta from log-scale params
+    .alpha_beta <- function(x) {
+      cl <- exp(x["lCL"]); v1 <- exp(x["lV1"]); q <- exp(x["lQ"]); v2 <- exp(x["lV2"])
+      k10 <- cl/v1; k12 <- q/v1; k21 <- q/v2
+      s <- k10 + k12 + k21
+      d <- sqrt(s^2 - 4 * k10 * k21)
+      c(alpha = 0.5*(s+d), beta = 0.5*(s-d))
+    }
+
+    pfuns <- list()
+    pfuns[[paste0("CL", pref, " (L/h)")]]  <- function(x) exp(x["lCL"])
+    pfuns[[paste0("V1", pref, " (L)")]]     <- function(x) exp(x["lV1"])
+    pfuns[[paste0("Q", pref, " (L/h)")]]    <- function(x) exp(x["lQ"])
+    pfuns[[paste0("V2", pref, " (L)")]]     <- function(x) exp(x["lV2"])
+    pfuns[[paste0("Vss", pref, " (L)")]]    <- function(x) exp(x["lV1"]) + exp(x["lV2"])
+    pfuns[["Alpha (1/h)"]]       <- function(x) .alpha_beta(x)["alpha"]
+    pfuns[["Beta (1/h)"]]        <- function(x) .alpha_beta(x)["beta"]
+    pfuns[["t1/2 alpha (h)"]]    <- function(x) log(2) / .alpha_beta(x)["alpha"]
+    pfuns[["t1/2 beta (h)"]]     <- function(x) log(2) / .alpha_beta(x)["beta"]
+    if (!is_iv && "lka" %in% names(fe)) {
+      pfuns[["ka (1/h)"]] <- function(x) exp(x["lka"])
+    }
+    params <- add_se_ci_to_params(params, fe, vcov_mat, pfuns, df_resid)
+  }
+
   return(params)
 }
 
-extract_3comp_params <- function(fe, dose, is_iv) {
+extract_3comp_params <- function(fe, dose, is_iv, vcov_mat = NULL, df_resid = NULL) {
   CL <- exp(fe["lCL"])
   V1 <- exp(fe["lV1"])
   Q2 <- exp(fe["lQ2"])
@@ -1070,6 +1168,23 @@ extract_3comp_params <- function(fe, dose, is_iv) {
   }
 
   rownames(params) <- NULL
+
+  # Add SE and 95% CI if vcov available
+  if (!is.null(vcov_mat) && !is.null(df_resid)) {
+    pfuns <- list()
+    pfuns[[paste0("CL", pref, " (L/h)")]]  <- function(x) exp(x["lCL"])
+    pfuns[[paste0("V1", pref, " (L)")]]     <- function(x) exp(x["lV1"])
+    pfuns[[paste0("Q2", pref, " (L/h)")]]   <- function(x) exp(x["lQ2"])
+    pfuns[[paste0("V2", pref, " (L)")]]     <- function(x) exp(x["lV2"])
+    pfuns[[paste0("Q3", pref, " (L/h)")]]   <- function(x) exp(x["lQ3"])
+    pfuns[[paste0("V3", pref, " (L)")]]     <- function(x) exp(x["lV3"])
+    pfuns[[paste0("Vss", pref, " (L)")]]    <- function(x) exp(x["lV1"]) + exp(x["lV2"]) + exp(x["lV3"])
+    if (!is_iv && "lka" %in% names(fe)) {
+      pfuns[["ka (1/h)"]] <- function(x) exp(x["lka"])
+    }
+    params <- add_se_ci_to_params(params, fe, vcov_mat, pfuns, df_resid)
+  }
+
   return(params)
 }
 

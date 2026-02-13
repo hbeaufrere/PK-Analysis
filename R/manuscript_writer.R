@@ -156,10 +156,17 @@ format_results_for_prompt <- function(analysis_type, nca_results = NULL,
     pop <- comp_results$summary
     indiv <- comp_results$params
 
-    lines <- c("Population (Fixed Effect) Parameter Estimates:")
+    has_se <- "SE" %in% names(pop) && "CI_lower" %in% names(pop)
+    lines <- c("Population (Fixed Effect) Parameter Estimates (Estimate [SE; 95% CI]):")
     for (i in seq_len(nrow(pop))) {
       if (pop$Parameter[i] %in% c("AIC", "BIC", "logLik")) next
-      lines <- c(lines, paste0("  ", pop$Parameter[i], " = ", signif(pop$Estimate[i], 4)))
+      line <- paste0("  ", pop$Parameter[i], " = ", signif(pop$Estimate[i], 4))
+      if (has_se && !is.na(pop$SE[i])) {
+        line <- paste0(line, ", SE = ", signif(pop$SE[i], 4),
+                       ", 95% CI = [", signif(pop$CI_lower[i], 4),
+                       " - ", signif(pop$CI_upper[i], 4), "]")
+      }
+      lines <- c(lines, line)
     }
 
     # Add model fit statistics

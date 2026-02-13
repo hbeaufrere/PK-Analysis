@@ -20,9 +20,7 @@ source("R/manuscript_writer.R")
 species_options <- c(
   "Orange-winged Amazon parrot", "Cockatiel", "Great horned owl",
   "Red-tailed hawk", "Rabbit", "Bearded dragon",
-  "Dog", "Cat", "Horse", "Cattle",
-  "Rat", "Mouse", "Pig", "Sheep", "Goat",
-  "Human", "Non-human Primate", "Guinea Pig", "Ferret", "Other"
+  "Other"
 )
 
 route_options <- c(
@@ -266,12 +264,44 @@ ui <- fluidPage(
               hr(),
               h4("Goodness-of-Fit Diagnostics", class = "section-title"),
               fluidRow(
-                column(6, plotOutput("diag_obs_pred", height = "350px")),
-                column(6, plotOutput("diag_resid", height = "350px"))
+                column(6,
+                  plotOutput("diag_obs_pred", height = "350px"),
+                  helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+                    tags$strong("Observed vs. Predicted:"),
+                    "Points should scatter closely around the line of identity (dashed diagonal). ",
+                    "Systematic deviations above or below the line indicate model bias. ",
+                    "A good fit shows points evenly distributed along the line with no trends."
+                  )
+                ),
+                column(6,
+                  plotOutput("diag_resid", height = "350px"),
+                  helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+                    tags$strong("Residuals vs. Predicted:"),
+                    "Residuals should be randomly scattered around zero (horizontal dashed line) with no pattern. ",
+                    "A funnel shape suggests heteroscedasticity (variance changes with concentration). ",
+                    "Systematic curvature indicates model misspecification."
+                  )
+                )
               ),
               fluidRow(
-                column(6, plotOutput("diag_qq", height = "350px")),
-                column(6, plotOutput("diag_hist", height = "350px"))
+                column(6,
+                  plotOutput("diag_qq", height = "350px"),
+                  helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+                    tags$strong("Q-Q Plot (Normal Quantiles):"),
+                    "Points should follow the diagonal reference line if residuals are normally distributed. ",
+                    "S-shaped deviations indicate heavy or light tails. ",
+                    "Departures at the extremes are common with small samples but large deviations may suggest outliers or model issues."
+                  )
+                ),
+                column(6,
+                  plotOutput("diag_hist", height = "350px"),
+                  helpText(style = "font-size: 11px; color: #555; margin-top: 5px;",
+                    tags$strong("Residual Histogram:"),
+                    "The distribution of residuals should be approximately bell-shaped and centered near zero. ",
+                    "Strong skewness or multimodality may indicate model misspecification or outliers. ",
+                    "With few subjects, some asymmetry is expected."
+                  )
+                )
               )
             )
           ),
@@ -785,11 +815,19 @@ server <- function(input, output, session) {
   output$comp_pop_table <- renderDT({
     req(rv$comp_results)
     df <- rv$comp_results$summary
-    # Remove diagnostic columns for display
-    display_df <- df[, c("Parameter", "Estimate")]
-    display_df$Estimate <- signif(display_df$Estimate, 4)
-    datatable(display_df, rownames = FALSE,
-              options = list(dom = 't', scrollX = TRUE))
+    # Show SE and 95% CI if available
+    if (all(c("SE", "CI_lower", "CI_upper") %in% names(df))) {
+      display_df <- df[, c("Parameter", "Estimate", "SE", "CI_lower", "CI_upper")]
+      datatable(display_df, rownames = FALSE,
+                colnames = c("Parameter", "Estimate", "SE", "95% CI Lower", "95% CI Upper"),
+                options = list(dom = 't', scrollX = TRUE)) %>%
+        formatSignif(columns = c("Estimate", "SE", "CI_lower", "CI_upper"), digits = 4)
+    } else {
+      display_df <- df[, c("Parameter", "Estimate")]
+      display_df$Estimate <- signif(display_df$Estimate, 4)
+      datatable(display_df, rownames = FALSE,
+                options = list(dom = 't', scrollX = TRUE))
+    }
   })
 
   output$comp_indiv_table <- renderDT({
