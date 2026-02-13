@@ -50,7 +50,10 @@ build_manuscript_prompt <- function(study_info, analysis_type, results_text) {
       " fitted via nonlinear mixed-effects modeling (NLME) with the nlme package in R. ",
       "Parameters were estimated on the log scale to ensure positivity. ",
       if (!is_iv) "Since the route was extravascular, apparent parameters (divided by bioavailability F) are reported. " else "",
-      "Between-subject variability was modeled using random effects."
+      "Between-subject variability was modeled using random effects. ",
+      "Summary statistics for individual parameter estimates included mean, standard deviation (SD), ",
+      "standard error of the mean (SEM), 95% confidence interval (CI) of the mean, geometric mean, ",
+      "geometric standard deviation (GSD), median, and range."
     )
   } else {
     paste0(
@@ -58,8 +61,25 @@ build_manuscript_prompt <- function(study_info, analysis_type, results_text) {
       " with the linear trapezoidal rule for AUC calculation. ",
       "The terminal elimination rate constant (lambda_z) was estimated by log-linear regression ",
       "of the terminal phase concentrations. ",
-      if (!is_iv) "Since the route was extravascular, apparent parameters (divided by bioavailability F) are reported. " else ""
+      if (!is_iv) "Since the route was extravascular, apparent parameters (divided by bioavailability F) are reported. " else "",
+      "Summary statistics included mean, standard deviation (SD), standard error of the mean (SEM), ",
+      "95% confidence interval (CI) of the mean, geometric mean, geometric standard deviation (GSD), median, and range."
     )
+  }
+
+  software_context <- paste0(
+    "All pharmacokinetic analyses were performed using R (R Foundation for Statistical Computing, Vienna, Austria; ",
+    "https://www.R-project.org/) with the following packages: shiny (web application framework), ",
+    "nlme (nonlinear mixed-effects modeling), ggplot2 (data visualization), DT (interactive tables), ",
+    "readxl (data import), and scales (axis formatting). ",
+    "A custom pharmacokinetic analysis application was developed with the assistance of Claude (Anthropic) ",
+    "and is freely available at https://github.com/hbeaufrere/PK-Analysis for transparency and reproducibility."
+  )
+
+  # Body weight info
+  weight_info <- ""
+  if (!is.null(study_info$body_weight) && !is.na(study_info$body_weight) && study_info$body_weight > 0) {
+    weight_info <- paste0("- Mean body weight: ", study_info$body_weight, " ", study_info$weight_unit, "\n")
   }
 
   prompt <- paste0(
@@ -69,21 +89,31 @@ build_manuscript_prompt <- function(study_info, analysis_type, results_text) {
     "- Species: ", study_info$species, "\n",
     "- Route: ", route_desc, "\n",
     "- Dose: ", study_info$dose, " ", study_info$dose_unit, "\n",
+    weight_info,
     "- Number of subjects: ", study_info$n_subjects, "\n",
     "- Time unit: ", study_info$time_unit, "\n",
     "- Concentration unit: ", study_info$conc_unit, "\n",
     "- Analysis method: ", model_desc, "\n\n",
     "METHODOLOGICAL CONTEXT:\n", method_context, "\n\n",
+    "SOFTWARE AND TOOLS:\n", software_context, "\n\n",
     "RESULTS:\n", results_text, "\n\n",
     "Please write the following three sections. Label each section clearly:\n\n",
     "STATISTICAL ANALYSIS (Materials and Methods):\n",
     "Write 1-2 paragraphs describing the statistical/pharmacokinetic analysis methods used. ",
-    "Include the software, the modeling approach, how parameters were estimated, ",
-    "and how summary statistics were computed.\n\n",
+    "Include the specific R software version and R packages used (nlme, ggplot2, shiny, etc.), ",
+    "the modeling approach, how parameters were estimated, and how summary statistics were computed ",
+    "(mean, SD, SEM, 95% CI of the mean, geometric mean, GSD, median, range). ",
+    "Mention that the analysis was performed using a custom pharmacokinetic application ",
+    "developed with the assistance of Claude (Anthropic, San Francisco, CA), available at ",
+    "https://github.com/hbeaufrere/PK-Analysis.\n\n",
     "RESULTS:\n",
     "Write 2-3 paragraphs reporting the key pharmacokinetic parameters with their values. ",
-    "Report mean \u00B1 SD or geometric mean (GSD) as appropriate. ",
-    "Describe the concentration-time profile and the key PK findings.\n\n",
+    "Report mean \u00B1 SD (or SEM) and 95% CI of the mean, or geometric mean (GSD) as appropriate. ",
+    "Describe the concentration-time profile and the key PK findings. ",
+    "Include a paragraph discussing whether the chosen statistical model (", model_desc,
+    ") was appropriate for these data. Evaluate goodness-of-fit metrics (AIC, BIC) if available, ",
+    "comment on residual diagnostics, and discuss whether the model assumptions were reasonable ",
+    "for this type of pharmacokinetic data.\n\n",
     "INTERPRETATION:\n",
     "Write 1-2 paragraphs interpreting the pharmacokinetic results. ",
     "Discuss what the parameters suggest about the drug's disposition in this species. ",
@@ -140,15 +170,30 @@ format_results_for_prompt <- function(analysis_type, nca_results = NULL,
                                 ", Log-Likelihood = ", round(pop$logLik[1], 2)))
     }
 
-    # Individual parameter summary
+    # Individual parameter summary with SEM and 95% CI
     if (!is.null(indiv) && nrow(indiv) > 0) {
       num_cols <- setdiff(names(indiv), "ID")
-      lines <- c(lines, "\nIndividual Parameter Summary (Mean \u00B1 SD):")
+      lines <- c(lines, "\nIndividual Parameter Summary (Mean \u00B1 SD [SEM; 95% CI]):")
       for (col in num_cols) {
         vals <- indiv[[col]]
         if (is.numeric(vals) && length(vals) > 1) {
-          lines <- c(lines, paste0("  ", col, ": ", signif(mean(vals), 4),
-                                    " \u00B1 ", signif(sd(vals), 4)))
+          n <- sum(!is.na(vals))
+          m <- mean(vals, na.rm = TRUE)
+          s <- sd(vals, na.rm = TRUE)
+          sem <- s / sqrt(n)
+          ci_lower <- m - qt(0.975, df = n - 1) * sem
+          ci_upper <- m + qt(0.975, df = n - 1) * sem
+          geo_vals <- vals[vals > 0 & !is.na(vals)]
+          geo_mean <- if (length(geo_vals) > 0) exp(mean(log(geo_vals))) else NA
+          gsd <- if (length(geo_vals) > 1) exp(sd(log(geo_vals))) else NA
+          lines <- c(lines, paste0(
+            "  ", col, ": Mean = ", signif(m, 4),
+            " \u00B1 ", signif(s, 4),
+            ", SEM = ", signif(sem, 4),
+            ", 95% CI = [", signif(ci_lower, 4), " - ", signif(ci_upper, 4), "]",
+            if (!is.na(geo_mean)) paste0(", Geometric Mean = ", signif(geo_mean, 4)) else "",
+            if (!is.na(gsd)) paste0(", GSD = ", signif(gsd, 4)) else ""
+          ))
         }
       }
       lines <- c(lines, paste0("\nNumber of subjects: ", length(unique(indiv$ID))))

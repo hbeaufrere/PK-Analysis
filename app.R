@@ -124,6 +124,15 @@ ui <- fluidPage(
                   choices = c("h" = "h", "min" = "min", "days" = "days"),
                   selected = "h"),
 
+      fluidRow(
+        column(6, numericInput("body_weight", "Body Weight (optional)",
+                               value = NA, min = 0.001, step = 0.1)),
+        column(6, selectInput("weight_unit", "Weight Unit",
+                              choices = c("kg", "g"),
+                              selected = "kg"))
+      ),
+      helpText("Enter mean body weight if dose is absolute (e.g., mg) and weight-normalized PK parameters are desired."),
+
       # Subject exclusion (appears when data is loaded)
       conditionalPanel(
         condition = "output.data_loaded",
@@ -321,6 +330,7 @@ server <- function(input, output, session) {
     nca_results = NULL,
     nca_summary_results = NULL,
     comp_results = NULL,
+    comp_summary_stats = NULL,
     analysis_complete = FALSE,
     analysis_type = NULL,
     error_msg = NULL
@@ -617,6 +627,9 @@ server <- function(input, output, session) {
         h4("Individual Parameter Estimates", class = "section-title"),
         DTOutput("comp_indiv_table"),
         br(),
+        h4("Summary Statistics of Individual Parameters", class = "section-title"),
+        DTOutput("comp_summary_table"),
+        br(),
         wellPanel(
           h5("Model Diagnostics"),
           uiOutput("model_info")
@@ -788,6 +801,49 @@ server <- function(input, output, session) {
       formatSignif(columns = num_cols, digits = 4)
   })
 
+  output$comp_summary_table <- renderDT({
+    req(rv$comp_results)
+    df <- rv$comp_results$params
+    req(df, nrow(df) > 1)
+    num_cols <- setdiff(names(df), "ID")
+
+    summary_rows <- list()
+    for (col in num_cols) {
+      vals <- df[[col]]
+      if (is.numeric(vals) && length(vals) > 1) {
+        n <- sum(!is.na(vals))
+        m <- mean(vals, na.rm = TRUE)
+        s <- sd(vals, na.rm = TRUE)
+        sem <- s / sqrt(n)
+        ci_lower <- m - qt(0.975, df = n - 1) * sem
+        ci_upper <- m + qt(0.975, df = n - 1) * sem
+        geo_vals <- vals[vals > 0 & !is.na(vals)]
+        geo_mean <- if (length(geo_vals) > 0) exp(mean(log(geo_vals))) else NA
+        gsd <- if (length(geo_vals) > 1) exp(sd(log(geo_vals))) else NA
+        med <- median(vals, na.rm = TRUE)
+        mn <- min(vals, na.rm = TRUE)
+        mx <- max(vals, na.rm = TRUE)
+        summary_rows[[length(summary_rows) + 1]] <- data.frame(
+          Parameter = col, N = n, Mean = m, SD = s, SEM = sem,
+          CI_lower = ci_lower, CI_upper = ci_upper,
+          Geo_Mean = geo_mean, GSD = gsd,
+          Median = med, Min = mn, Max = mx,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+    summary_df <- do.call(rbind, summary_rows)
+    rv$comp_summary_stats <- summary_df
+
+    datatable(summary_df, rownames = FALSE,
+              colnames = c("Parameter", "N", "Mean", "SD", "SEM",
+                           "95% CI Lower", "95% CI Upper",
+                           "Geo Mean", "GSD", "Median", "Min", "Max"),
+              options = list(scrollX = TRUE, dom = 't')) %>%
+      formatSignif(columns = c("Mean", "SD", "SEM", "CI_lower", "CI_upper",
+                                "Geo_Mean", "GSD", "Median", "Min", "Max"), digits = 4)
+  })
+
   output$model_info <- renderUI({
     req(rv$comp_results)
     pop <- rv$comp_results$summary
@@ -862,14 +918,16 @@ server <- function(input, output, session) {
     # Gather study info
     n_subj <- length(input$included_subjects)
     study_info <- list(
-      drug_name  = if (nchar(input$drug_name) > 0) input$drug_name else "Unknown drug",
-      species    = input$species,
-      route      = input$route,
-      dose       = input$dose,
-      dose_unit  = input$dose_unit,
-      time_unit  = input$time_unit,
-      conc_unit  = input$conc_unit,
-      n_subjects = n_subj
+      drug_name   = if (nchar(input$drug_name) > 0) input$drug_name else "Unknown drug",
+      species     = input$species,
+      route       = input$route,
+      dose        = input$dose,
+      dose_unit   = input$dose_unit,
+      time_unit   = input$time_unit,
+      conc_unit   = input$conc_unit,
+      n_subjects  = n_subj,
+      body_weight = input$body_weight,
+      weight_unit = input$weight_unit
     )
 
     rv_manuscript$content <- NULL
