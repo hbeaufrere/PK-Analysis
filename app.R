@@ -983,7 +983,7 @@ server <- function(input, output, session) {
   })
 
   # ---- Manuscript Generation ----
-  rv_manuscript <- reactiveValues(content = NULL, error = NULL, generating = FALSE)
+  rv_manuscript <- reactiveValues(content = NULL, error = NULL, generating = FALSE, table = NULL)
 
   observeEvent(input$generate_manuscript, {
     req(rv$analysis_complete)
@@ -1011,6 +1011,7 @@ server <- function(input, output, session) {
 
     rv_manuscript$content <- NULL
     rv_manuscript$error <- NULL
+    rv_manuscript$table <- NULL
     rv_manuscript$generating <- TRUE
 
     # Run generation
@@ -1021,7 +1022,8 @@ server <- function(input, output, session) {
         analysis_type = rv$analysis_type,
         nca_results   = rv$nca_results,
         nca_summary   = rv$nca_summary_results,
-        comp_results  = rv$comp_results
+        comp_results  = rv$comp_results,
+        comp_summary_stats = rv$comp_summary_stats
       )
       incProgress(0.7, detail = "Done!")
     })
@@ -1033,6 +1035,7 @@ server <- function(input, output, session) {
       showNotification(result$error, type = "error", duration = 10)
     } else {
       rv_manuscript$content <- result$content
+      rv_manuscript$table <- result$table
       showNotification("Manuscript sections generated!", type = "message", duration = 5)
     }
   })
@@ -1045,16 +1048,56 @@ server <- function(input, output, session) {
       div(class = "status-box status-error", icon("exclamation-triangle"),
           rv_manuscript$error)
     } else if (!is.null(rv_manuscript$content)) {
-      # Parse the content into sections
+      # Parse the content and insert table between RESULTS and INTERPRETATION
       content <- rv_manuscript$content
+      tbl <- rv_manuscript$table
+
+      # Split content at INTERPRETATION section to insert table before it
+      content_parts <- strsplit(content, "(?i)(\\n\\s*INTERPRETATION[:\\s]*\\n)", perl = TRUE)[[1]]
+
+      if (length(content_parts) >= 2 && !is.null(tbl)) {
+        # Extract the interpretation header from original text
+        interp_match <- regmatches(content, regexpr("(?i)\\n\\s*INTERPRETATION[:\\s]*\\n", content, perl = TRUE))
+        before_interp <- content_parts[1]
+        after_interp <- paste(content_parts[-1], collapse = interp_match)
+
+        section_html <- tagList(
+          # Methods + Results text
+          div(class = "manuscript-section",
+            HTML(gsub("\n", "<br/>", htmltools::htmlEscape(before_interp)))
+          ),
+          # Table 1
+          div(class = "manuscript-section", style = "margin: 24px 0;",
+            p(tags$b(tbl$title), style = "font-size: 13px; margin-bottom: 6px;"),
+            HTML(tbl$html),
+            p(tags$em(tbl$legend), style = "font-size: 11px; color: #555; margin-top: 6px;")
+          ),
+          # Interpretation
+          div(class = "manuscript-section",
+            HTML(gsub("\n", "<br/>", htmltools::htmlEscape(paste0(interp_match, after_interp))))
+          )
+        )
+      } else {
+        # Fallback: append table at the end if we can't split
+        section_html <- tagList(
+          div(class = "manuscript-section",
+            HTML(gsub("\n", "<br/>", htmltools::htmlEscape(content)))
+          ),
+          if (!is.null(tbl)) {
+            div(class = "manuscript-section", style = "margin: 24px 0;",
+              p(tags$b(tbl$title), style = "font-size: 13px; margin-bottom: 6px;"),
+              HTML(tbl$html),
+              p(tags$em(tbl$legend), style = "font-size: 11px; color: #555; margin-top: 6px;")
+            )
+          }
+        )
+      }
 
       tagList(
         div(class = "manuscript-output",
           h4(icon("file-alt"), " Generated Manuscript Sections"),
           hr(),
-          div(class = "manuscript-section",
-            HTML(gsub("\n", "<br/>", htmltools::htmlEscape(content)))
-          )
+          section_html
         ),
         br(),
         downloadButton("download_manuscript", "Download as Text File", class = "btn-block")
@@ -1067,7 +1110,25 @@ server <- function(input, output, session) {
       paste0("pk_manuscript_", rv$analysis_type, "_", Sys.Date(), ".txt")
     },
     content = function(file) {
-      writeLines(rv_manuscript$content, file)
+      lines <- rv_manuscript$content
+      # Insert Table 1 between RESULTS and INTERPRETATION if available
+      tbl <- rv_manuscript$table
+      if (!is.null(tbl)) {
+        parts <- strsplit(lines, "(?i)(\\n\\s*INTERPRETATION[:\\s]*\\n)", perl = TRUE)[[1]]
+        if (length(parts) >= 2) {
+          interp_match <- regmatches(lines, regexpr("(?i)\\n\\s*INTERPRETATION[:\\s]*\\n", lines, perl = TRUE))
+          table_block <- paste0(
+            "\n\n", tbl$title, "\n\n",
+            tbl$text, "\n\n",
+            tbl$legend, "\n"
+          )
+          lines <- paste0(parts[1], table_block, interp_match, paste(parts[-1], collapse = interp_match))
+        } else {
+          # Append at end
+          lines <- paste0(lines, "\n\n", tbl$title, "\n\n", tbl$text, "\n\n", tbl$legend, "\n")
+        }
+      }
+      writeLines(lines, file)
     }
   )
 

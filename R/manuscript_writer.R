@@ -110,6 +110,9 @@ build_manuscript_prompt <- function(study_info, analysis_type, results_text) {
     "Write 2-3 paragraphs reporting the key pharmacokinetic parameters with their values. ",
     "Report mean \u00B1 SD (or SEM) and 95% CI of the mean, or geometric mean (GSD) as appropriate. ",
     "Describe the concentration-time profile and the key PK findings. ",
+    "Reference 'Table 1' when directing the reader to the full parameter summary ",
+    "(e.g., 'Pharmacokinetic parameters are summarized in Table 1.'). ",
+    "A formatted Table 1 with all parameters will be automatically inserted after this section. ",
     "Include a paragraph discussing whether the chosen statistical model (", model_desc,
     ") was appropriate for these data. Evaluate goodness-of-fit metrics (AIC, BIC) if available, ",
     "comment on residual diagnostics, and discuss whether the model assumptions were reasonable ",
@@ -273,6 +276,190 @@ call_claude_api <- function(api_key, system_prompt, user_prompt,
   return(list(content = text, error = NULL))
 }
 
+#' Build a publication-ready PK parameter table for the manuscript
+#'
+#' Generates both an HTML table (for display) and a plain-text table (for download).
+#' For NCA: uses nca_summary. For compartmental: uses comp_summary_stats.
+#'
+#' @param study_info List with drug_name, species, route, dose, dose_unit, conc_unit, time_unit, n_subjects
+#' @param analysis_type Character: "NCA", "1comp", "2comp", "3comp"
+#' @param nca_summary Data frame from nca_summary() or NULL
+#' @param comp_summary_stats Data frame of individual param summary stats or NULL
+#' @return List with 'title' (character), 'legend' (character),
+#'   'html' (character HTML string), 'text' (character plain-text table)
+build_manuscript_table <- function(study_info, analysis_type,
+                                    nca_summary = NULL, comp_summary_stats = NULL) {
+  is_iv <- study_info$route %in% c("IV", "IV_INF")
+  route_desc <- switch(study_info$route,
+    "IV"     = "intravenous",
+    "IV_INF" = "intravenous infusion",
+    "PO"     = "oral",
+    "SC"     = "subcutaneous",
+    "IM"     = "intramuscular",
+    "IP"     = "intraperitoneal",
+    "EV"     = "extravascular",
+    tolower(study_info$route)
+  )
+  model_desc <- switch(analysis_type,
+    "NCA"   = "non-compartmental analysis",
+    "1comp" = "one-compartment model",
+    "2comp" = "two-compartment model",
+    "3comp" = "three-compartment model"
+  )
+
+  # Table title
+  title <- paste0(
+    "Table 1. Pharmacokinetic parameters of ", study_info$drug_name,
+    " following ", route_desc, " administration at ",
+    study_info$dose, " ", study_info$dose_unit, " to ",
+    study_info$n_subjects, " ", study_info$species,
+    " determined by ", model_desc, "."
+  )
+
+  # Parameter label mapping (with units) for NCA
+  conc_unit <- study_info$conc_unit
+  time_unit <- study_info$time_unit
+  cl_label <- if (is_iv) "CL" else "CL/F"
+  vd_label <- if (is_iv) "Vd" else "Vd/F"
+  vss_label <- if (is_iv) "Vss" else "Vss/F"
+
+  nca_labels <- c(
+    Cmax        = paste0("C\u2098\u2090\u2093 (", conc_unit, ")"),
+    Tmax        = paste0("T\u2098\u2090\u2093 (", time_unit, ")"),
+    AUC_last    = paste0("AUC\u2097\u2090\u209B\u209C (", conc_unit, "\u00B7", time_unit, ")"),
+    AUC_inf     = paste0("AUC\u221E (", conc_unit, "\u00B7", time_unit, ")"),
+    AUC_extrap_pct = "AUC extrapolated (%)",
+    Lambda_z    = paste0("\u03BB\u1D63 (1/", time_unit, ")"),
+    Half_life   = paste0("t\u00BD (", time_unit, ")"),
+    Lambda_z_R2 = "Terminal R\u00B2",
+    MRT         = paste0("MRT (", time_unit, ")"),
+    CL          = paste0(cl_label, " (L/", time_unit, ")"),
+    Vd          = paste0(vd_label, " (L)"),
+    Vss         = paste0(vss_label, " (L)")
+  )
+
+  # Select data source
+  if (analysis_type == "NCA" && !is.null(nca_summary)) {
+    summ <- nca_summary
+    label_map <- nca_labels
+  } else if (!is.null(comp_summary_stats)) {
+    summ <- comp_summary_stats
+    label_map <- NULL  # compartmental params keep their own names
+  } else {
+    return(NULL)
+  }
+
+  # Build rows
+  fmt <- function(x, digits = 4) {
+    if (is.na(x)) return("\u2014")
+    formatC(signif(x, digits), format = "fg", flag = "")
+  }
+
+  rows_html <- character(0)
+  rows_text <- character(0)
+
+  has_ci <- all(c("CI_lower", "CI_upper") %in% names(summ))
+
+  for (i in seq_len(nrow(summ))) {
+    row <- summ[i, ]
+    param_raw <- as.character(row$Parameter)
+
+    # Get display label
+    if (!is.null(label_map) && param_raw %in% names(label_map)) {
+      param_label <- label_map[[param_raw]]
+    } else {
+      param_label <- param_raw
+    }
+
+    n_val     <- row$N
+    mean_val  <- fmt(row$Mean)
+    sd_val    <- fmt(row$SD)
+    mean_sd   <- paste0(mean_val, " \u00B1 ", sd_val)
+    median_val <- fmt(row$Median)
+    range_val  <- paste0(fmt(row$Min), "\u2013", fmt(row$Max))
+
+    # Geometric mean (GSD) if available
+    geo_col <- if ("Geo_Mean" %in% names(row)) row$Geo_Mean else NA
+    gsd_col <- if ("GSD" %in% names(row)) row$GSD else NA
+    if (!is.na(geo_col)) {
+      if (!is.na(gsd_col)) {
+        geo_str <- paste0(fmt(geo_col), " (", fmt(gsd_col), ")")
+      } else {
+        geo_str <- fmt(geo_col)
+      }
+    } else {
+      geo_str <- "\u2014"
+    }
+
+    # HTML row
+    rows_html <- c(rows_html, paste0(
+      "<tr>",
+      "<td style='text-align:left; padding:4px 8px;'>", htmltools::htmlEscape(param_label), "</td>",
+      "<td style='text-align:center; padding:4px 8px;'>", htmltools::htmlEscape(mean_sd), "</td>",
+      "<td style='text-align:center; padding:4px 8px;'>", htmltools::htmlEscape(median_val), "</td>",
+      "<td style='text-align:center; padding:4px 8px;'>", htmltools::htmlEscape(range_val), "</td>",
+      "<td style='text-align:center; padding:4px 8px;'>", htmltools::htmlEscape(geo_str), "</td>",
+      "</tr>"
+    ))
+
+    # Text row (tab-delimited)
+    rows_text <- c(rows_text, paste(param_label, mean_sd, median_val, range_val, geo_str, sep = "\t"))
+  }
+
+  # Column headers
+  col_headers <- c("Parameter", "Mean \u00B1 SD", "Median", "Range", "Geometric Mean (GSD)")
+
+  # HTML table
+  header_html <- paste0(
+    "<tr>",
+    paste0("<th style='text-align:center; padding:6px 8px; border-bottom:2px solid #333;'>",
+           htmltools::htmlEscape(col_headers), "</th>", collapse = ""),
+    "</tr>"
+  )
+  # Left-align the Parameter header
+  header_html <- sub("text-align:center;(.*?)>Parameter", "text-align:left;\\1>Parameter", header_html)
+
+  html_table <- paste0(
+    "<table style='border-collapse:collapse; width:100%; font-size:13px; margin:10px 0;",
+    " border-top:2px solid #333; border-bottom:2px solid #333;'>",
+    "<thead>", header_html, "</thead>",
+    "<tbody>", paste(rows_html, collapse = ""), "</tbody>",
+    "</table>"
+  )
+
+  # Legend
+  legend_parts <- c(
+    paste0("Data are presented as mean \u00B1 standard deviation (SD), median, range, ",
+           "and geometric mean with geometric standard deviation (GSD) in parentheses.")
+  )
+  if (!is_iv) {
+    legend_parts <- c(legend_parts,
+      "/F indicates parameters are apparent values not corrected for bioavailability.")
+  }
+  legend_parts <- c(legend_parts,
+    paste0("n = ", summ$N[1], " ", study_info$species, "."),
+    paste0("\u03BB\u1D63, terminal elimination rate constant; ",
+           "AUC, area under the concentration-time curve; ",
+           "C\u2098\u2090\u2093, maximum concentration; ",
+           "CL, clearance; MRT, mean residence time; ",
+           "t\u00BD, elimination half-life; ",
+           "T\u2098\u2090\u2093, time to maximum concentration; ",
+           "Vd, volume of distribution; ",
+           "Vss, volume of distribution at steady state."))
+  legend <- paste(legend_parts, collapse = " ")
+
+  # Plain-text table
+  text_header <- paste(col_headers, collapse = "\t")
+  text_table <- paste(c(text_header, rows_text), collapse = "\n")
+
+  return(list(
+    title  = title,
+    legend = legend,
+    html   = html_table,
+    text   = text_table
+  ))
+}
+
 #' Main function: generate manuscript sections
 #'
 #' @param api_key Character Claude API key
@@ -284,7 +471,7 @@ call_claude_api <- function(api_key, system_prompt, user_prompt,
 #' @return List with 'content' or 'error'
 generate_manuscript <- function(api_key, study_info, analysis_type,
                                 nca_results = NULL, nca_summary = NULL,
-                                comp_results = NULL) {
+                                comp_results = NULL, comp_summary_stats = NULL) {
   # Build results text
   results_text <- format_results_for_prompt(
     analysis_type, nca_results, nca_summary, comp_results
@@ -296,5 +483,13 @@ generate_manuscript <- function(api_key, study_info, analysis_type,
 
   # Call API
   result <- call_claude_api(api_key, sys_prompt, user_prompt)
+
+  # Build manuscript table from actual data
+  result$table <- build_manuscript_table(
+    study_info, analysis_type,
+    nca_summary = nca_summary,
+    comp_summary_stats = comp_summary_stats
+  )
+
   return(result)
 }
