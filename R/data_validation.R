@@ -67,9 +67,9 @@ validate_and_reshape <- function(df) {
   }
 
   time_col_name <- names(df)[time_col_idx]
-  conc_col_names <- names(df)[-time_col_idx]
+  other_col_names <- names(df)[-time_col_idx]
 
-  if (length(conc_col_names) < 1) {
+  if (length(other_col_names) < 1) {
     return(list(data = NULL, error = "No concentration columns found. File needs Time plus at least one animal column."))
   }
 
@@ -80,13 +80,24 @@ validate_and_reshape <- function(df) {
                 error = paste0("The Time column ('", time_col_name, "') does not contain numeric values.")))
   }
 
-  # Check that concentration columns are numeric
-  for (cn in conc_col_names) {
+  # Keep only columns that contain numeric data (skip ID, text columns, etc.)
+  conc_col_names <- c()
+  skipped <- c()
+  for (cn in other_col_names) {
     test_vals <- suppressWarnings(as.numeric(df[[cn]]))
     if (all(is.na(test_vals))) {
-      return(list(data = NULL,
-                  error = paste0("Column '", cn, "' does not contain numeric concentration values.")))
+      skipped <- c(skipped, cn)
+    } else {
+      conc_col_names <- c(conc_col_names, cn)
     }
+  }
+
+  if (length(skipped) > 0) {
+    message(paste("Skipped non-numeric columns:", paste(skipped, collapse = ", ")))
+  }
+
+  if (length(conc_col_names) < 1) {
+    return(list(data = NULL, error = "No numeric concentration columns found after the Time column."))
   }
 
   # Reshape from wide to long
