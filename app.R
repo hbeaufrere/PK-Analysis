@@ -77,7 +77,7 @@ ui <- fluidPage(
       fileInput("data_file", "Upload PK Data",
                 accept = c(".csv", ".xls", ".xlsx"),
                 placeholder = "CSV or Excel file"),
-      helpText("Required columns: ID, Time, Concentration"),
+      helpText("Format: first column = Time, each subsequent column = concentrations for one animal"),
 
       hr(),
       h4("Study Information", class = "section-title"),
@@ -293,7 +293,7 @@ server <- function(input, output, session) {
       div(class = "status-box status-error", icon("exclamation-triangle"), rv$error_msg)
     } else if (is.null(rv$pk_data)) {
       div(class = "status-box status-info", icon("info-circle"),
-          "Upload a CSV or Excel file with columns: ID, Time, Concentration")
+          "Upload a CSV or Excel file. First column = Time, each subsequent column = concentrations for one animal.")
     } else {
       div(class = "status-box status-success", icon("check-circle"),
           paste("Data loaded successfully:", rv$data_summary$n_subjects, "subjects,",

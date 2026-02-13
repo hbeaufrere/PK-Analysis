@@ -46,13 +46,19 @@ rsconnect::deployApp()
 
 ## Input Data Format
 
-Upload a CSV or Excel file with these columns (case-insensitive):
+Upload a CSV or Excel file in **wide format**: the first column is Time, and each subsequent column contains the concentrations for one animal/subject. The column headers become the subject IDs.
 
-| Column | Aliases accepted |
-|--------|-----------------|
-| **ID** | id, subject, subj, subject_id, animal |
-| **Time** | time, time_h, time_hr, time_min, timepoint |
-| **Concentration** | concentration, conc, concentrations, dv, cp, plasma_conc |
+Example:
+
+| Time | Animal1 | Animal2 | Animal3 |
+|------|---------|---------|---------|
+| 0    | 0       | 0       | 0       |
+| 0.5  | 14.5    | 16.1    | 13.2    |
+| 1    | 22.2    | 24.7    | 19.8    |
+| 2    | 18.7    | 20.1    | 16.9    |
+| ...  | ...     | ...     | ...     |
+
+The Time column is detected automatically (accepts headers like `Time`, `Time_h`, `Timepoint`, etc.). If no match is found, the first column is used as Time.
 
 Sample datasets are included in the `data/` folder.
 
