@@ -15,7 +15,9 @@ library(ggplot2)
 #' @return ggplot object
 plot_mean_conc_time <- function(df, log_y = FALSE, species = "", drug_name = "",
                                  time_unit = "h", conc_unit = "ng/mL",
-                                 color_mode = "color", show_ci = TRUE) {
+                                 color_mode = "color", show_ci = TRUE,
+                                 point_size = 2.5, line_width = 1,
+                                 errorbar_width = 0.5, show_grid = TRUE) {
   # Compute mean and SEM at each time point
   summary_df <- aggregate(Conc ~ Time, data = df, FUN = function(x) {
     c(mean = mean(x, na.rm = TRUE),
@@ -58,9 +60,9 @@ plot_mean_conc_time <- function(df, log_y = FALSE, species = "", drug_name = "",
   p <- p +
     geom_errorbar(aes(ymin = Lower, ymax = Upper),
                   width = max(diff(range(summary_df$Time))) * 0.015,
-                  color = line_col, linewidth = 0.5) +
-    geom_line(color = line_col, linewidth = 1) +
-    geom_point(color = line_col, size = 2.5) +
+                  color = line_col, linewidth = errorbar_width) +
+    geom_line(color = line_col, linewidth = line_width) +
+    geom_point(color = line_col, size = point_size) +
     labs(
       title = plot_title,
       x = paste0("Time (", time_unit, ")"),
@@ -73,6 +75,13 @@ plot_mean_conc_time <- function(df, log_y = FALSE, species = "", drug_name = "",
       panel.grid.minor = element_line(color = "grey90"),
       plot.caption = element_text(hjust = 0, size = 10, color = "grey50")
     )
+
+  if (!show_grid) {
+    p <- p + theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+  }
 
   if (log_y) {
     p <- p + scale_y_log10(
@@ -94,15 +103,17 @@ plot_mean_conc_time <- function(df, log_y = FALSE, species = "", drug_name = "",
 #' @return ggplot object
 plot_individual_conc_time <- function(df, log_y = FALSE,
                                        time_unit = "h", conc_unit = "ng/mL",
-                                       color_mode = "color") {
+                                       color_mode = "color",
+                                       point_size = 1.5, line_width = 0.7,
+                                       show_grid = TRUE) {
   is_bw <- (color_mode == "bw")
   n_subj <- length(unique(df$ID))
 
   if (is_bw) {
     # Use different linetypes and shapes for BW mode
     p <- ggplot(df, aes(x = Time, y = Conc, group = ID, linetype = ID, shape = ID)) +
-      geom_line(linewidth = 0.7, alpha = 0.8) +
-      geom_point(size = 1.8, alpha = 0.9) +
+      geom_line(linewidth = line_width, alpha = 0.8) +
+      geom_point(size = point_size, alpha = 0.9) +
       labs(linetype = "Subject", shape = "Subject")
     if (n_subj <= 6) {
       p <- p + scale_linetype_manual(values = rep(c("solid", "dashed", "dotted",
@@ -110,8 +121,8 @@ plot_individual_conc_time <- function(df, log_y = FALSE,
     }
   } else {
     p <- ggplot(df, aes(x = Time, y = Conc, group = ID, color = ID)) +
-      geom_line(linewidth = 0.7, alpha = 0.7) +
-      geom_point(size = 1.5, alpha = 0.8) +
+      geom_line(linewidth = line_width, alpha = 0.7) +
+      geom_point(size = point_size, alpha = 0.8) +
       labs(color = "Subject")
   }
 
@@ -126,6 +137,13 @@ plot_individual_conc_time <- function(df, log_y = FALSE,
       plot.title = element_text(hjust = 0.5, face = "bold"),
       legend.position = "right"
     )
+
+  if (!show_grid) {
+    p <- p + theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+  }
 
   if (log_y) {
     p <- p + scale_y_log10(

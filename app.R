@@ -222,12 +222,16 @@ ui <- fluidPage(
                                         inline = FALSE, selected = "mean")),
                 column(3,
                   checkboxInput("log_y_obs", "Log-transformed Y-axis", value = FALSE),
-                  checkboxInput("show_ci", "Show confidence shading", value = TRUE)
+                  checkboxInput("show_ci", "Show confidence shading", value = TRUE),
+                  checkboxInput("show_grid", "Show background grid", value = TRUE)
                 ),
                 column(3,
                   radioButtons("color_mode", "Color Scheme",
                                choices = c("Color" = "color", "Black & White" = "bw"),
-                               inline = FALSE, selected = "color")
+                               inline = FALSE, selected = "color"),
+                  sliderInput("point_size", "Point Size", min = 1, max = 8, value = 2.5, step = 0.5),
+                  sliderInput("line_width", "Line Width", min = 0.5, max = 4, value = 1, step = 0.25),
+                  sliderInput("errorbar_width", "Error Bar Width", min = 0.3, max = 3, value = 0.5, step = 0.1)
                 ),
                 column(3,
                   downloadButton("download_mean_plot", "Download Mean Plot", class = "btn-block btn-sm"),
@@ -538,7 +542,11 @@ server <- function(input, output, session) {
       time_unit = input$time_unit,
       conc_unit = input$conc_unit,
       color_mode = input$color_mode,
-      show_ci = input$show_ci
+      show_ci = input$show_ci,
+      point_size = input$point_size,
+      line_width = input$line_width,
+      errorbar_width = input$errorbar_width,
+      show_grid = input$show_grid
     )
   })
 
@@ -550,7 +558,10 @@ server <- function(input, output, session) {
       log_y = input$log_y_obs,
       time_unit = input$time_unit,
       conc_unit = input$conc_unit,
-      color_mode = input$color_mode
+      color_mode = input$color_mode,
+      point_size = input$point_size,
+      line_width = input$line_width,
+      show_grid = input$show_grid
     )
   })
 
