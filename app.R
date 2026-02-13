@@ -79,7 +79,7 @@ ui <- fluidPage(
     .btn-manuscript:hover { background: linear-gradient(135deg, #4a2475 0%, #6a348d 100%); color: white; }
     .api-key-input { max-width: 500px; }
     .compound-section { border-top: 2px solid #2d6a9f; padding-top: 15px; margin-top: 25px; }
-    .btn-block { white-space: normal; }
+    .sidebar .btn.btn-block { white-space: normal !important; word-wrap: break-word; }
   "))),
 
   # Header
