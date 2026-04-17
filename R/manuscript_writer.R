@@ -218,10 +218,10 @@ format_results_for_prompt <- function(analysis_type, nca_results = NULL,
 #' @param api_key Character API key for Claude
 #' @param system_prompt Character system prompt
 #' @param user_prompt Character user prompt
-#' @param model Character model ID (default: claude-sonnet-4-5-20250929)
+#' @param model Character model ID (default: claude-opus-4-7)
 #' @return List with 'content' (character) or 'error' (character)
 call_claude_api <- function(api_key, system_prompt, user_prompt,
-                            model = "claude-sonnet-4-5-20250929") {
+                            model = "claude-opus-4-7") {
   if (!requireNamespace("httr", quietly = TRUE)) {
     return(list(content = NULL, error = "The 'httr' package is required. Install it with: install.packages('httr')"))
   }
